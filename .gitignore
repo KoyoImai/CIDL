@@ -1,6 +1,6 @@
 logs
 outputs
-
+checkpoint
 
 __pycache__/
 *.pyc

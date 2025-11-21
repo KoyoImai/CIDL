@@ -5,7 +5,7 @@
     "shuffle": true,
     "init_cls": 50,
     "increment": 5,
-    "model_name": "prl",
+    "model_name": "prl-mu",
     "convnet_type": "resnet18_cbam",
     "device": ["0"],
     "seed": [1993],

@@ -1,5 +1,7 @@
 from models.finetune import Finetune
 from models.PRL import PRL
+from models.PRL_MU import PRL_MU
+
 
 def get_model(model_name, args):
 
