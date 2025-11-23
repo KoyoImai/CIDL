@@ -30,6 +30,10 @@ class PRL_MU(BaseLearner):
         # プロトタイプの初期化
         self._protos = {}
 
+        # 忘却クラスの初期化
+        self.forget_classes = []                # 現在タスクで忘却する対象クラスのリスト
+        self.forget_list = args["forget_cls"]   # 将来忘却をするクラスのリスト
+
         # データセットのサイズを設定
         if "cifar" in self.args["dataset"]:
             self.size = 32
@@ -67,9 +71,16 @@ class PRL_MU(BaseLearner):
         self._total_classes = self._known_classes + \
             data_manager.get_task_size(self._cur_task)
         
+        # 忘却クラスの更新
+        self.forget_classes += [cls for cls in self.forget_list[self._cur_task]]
+        logging.info(
+            "forget classes on task{}: {}".format(self._cur_task, self.forget_classes))
+
         # model の fc層 の出力次元数を変更
         self._network.update_fc(self._total_classes*4)
         self._network_module_ptr = self._network
+        logging.info(
+            "model: {}".format(self._network_module_ptr))
         logging.info(
             'Learning on {}-{}'.format(self._known_classes, self._total_classes))
 
@@ -170,6 +181,8 @@ class PRL_MU(BaseLearner):
             # 1エポック分の学習を実行
             for i, (_, inputs, targets) in enumerate(train_loader):
 
+                # logging.info("targets: ", targets)
+
                 # 入力とラベルを device 上に配置
                 inputs, targets = inputs.to(
                     self._device, non_blocking=True), targets.to(self._device, non_blocking=True)
@@ -229,11 +242,26 @@ class PRL_MU(BaseLearner):
         # 直交損失: AE(protos) と AE(旧feature) の cosine を下げる
         features_old_norm = F.normalize(features_old, p=2, dim=1)
 
-        # プロトタイプの準備
-        protos = self._protos.values()             # 各クラスのプロトタイプ
-        protos = torch.from_numpy(np.asarray(list(protos))).float().to(self._device,non_blocking=True)
-        protos = self.old_ae(protos)               # AutoEncoderで射影
+        # 忘却クラスのプロトタイプの前準備
+        valid_protos = [
+            proto for cls_id, proto in self._protos.items()
+            if cls_id not in self.forget_classes
+        ]
+
+        if len(valid_protos) == 0:
+            # 直交させる相手がいないので align 項だけにする
+            return loss_align
+
+        protos = np.asarray(valid_protos)  # shape: [num_valid_classes, D]
+        protos = torch.from_numpy(protos).float().to(self._device, non_blocking=True)
+        protos = self.old_ae(protos)       # AutoEncoderで射影
         protos = F.normalize(protos, p=2, dim=1)
+
+        # # プロトタイプの準備（not Machine Unlearning用）
+        # protos = self._protos.values()             # 各クラスのプロトタイプ
+        # protos = torch.from_numpy(np.asarray(list(protos))).float().to(self._device,non_blocking=True)
+        # protos = self.old_ae(protos)               # AutoEncoderで射影
+        # protos = F.normalize(protos, p=2, dim=1)
 
         similarity = torch.matmul(protos, features_old_norm.t())
         similarity = similarity.sum() / (similarity.shape[0]*similarity.shape[1])
@@ -280,7 +308,6 @@ class PRL_MU(BaseLearner):
         # =============================
         # 旧クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
         # =============================
-        
         # 擬似 feature ベクトルを追加するリスト
         proto_features = []
         
@@ -288,7 +315,17 @@ class PRL_MU(BaseLearner):
         proto_targets = []
 
         # 旧タスクに存在するラベルのリスト
+        # print("self.forget_classes: ", self.forget_classes)
         old_class_list = list(self._protos.keys())
+        # print("old_class_list 1: ", old_class_list)
+
+        # 旧タスクのラベルリストから忘却対象のクラスを除外する
+        old_class_list = [c for c in old_class_list if c not in self.forget_classes]
+        # print("old_class_list 2: ", old_class_list)
+
+        if len(old_class_list) == 0:
+            loss_proto = torch.tensor(0., device=self._device)
+            return logits, loss_new, loss_fkd, loss_proto, torch.tensor(0., device=self._device), loss_pkd
 
         # バッチサイズ分だけサンプルを作成する
         for _ in range(features.shape[0]//4): # batch_size = feature.shape[0] // 4
@@ -349,18 +386,208 @@ class PRL_MU(BaseLearner):
 
         return np.concatenate(y_pred), np.concatenate(y_true)  
     
-    def eval_task(self):
-        y_pred, y_true = self._eval_cnn(self.test_loader)
-        cnn_accy = self._evaluate(y_pred, y_true)
 
-        if hasattr(self, '_class_means'):
-            y_pred, y_true = self._eval_nme(self.test_loader, self._class_means)
-            nme_accy = self._evaluate(y_pred, y_true)
-        elif hasattr(self, '_protos'):
-            protos = list(self._protos.values())
-            y_pred, y_true = self._eval_nme(self.test_loader, protos/np.linalg.norm(protos,axis=1)[:,None])
-            nme_accy = self._evaluate(y_pred, y_true)
+    def eval_task(self):
+        # -------------------------
+        # CNN 評価（保持クラスだけ）
+        # -------------------------
+        y_pred, y_true = self._eval_cnn(self.test_loader)
+        y_true = np.asarray(y_true)
+
+        # 忘却クラス / 保持クラスの分割
+        forget_set = set(getattr(self, "forget_classes", []))
+        if len(forget_set) > 0:
+            mask_forget = np.isin(y_true, list(forget_set))
         else:
-            nme_accy = None
+            mask_forget = np.zeros_like(y_true, dtype=bool)
+        mask_retain = ~mask_forget
+
+        # 保持クラスのみで CNN の精度を計算
+        if mask_retain.any():
+            y_pred_retain = y_pred[mask_retain]
+            y_true_retain = y_true[mask_retain]
+        else:
+            logging.warning(
+                "MU eval (CNN): no retain samples found, using all samples for metrics."
+            )
+            y_pred_retain = y_pred
+            y_true_retain = y_true
+        
+        cnn_accy = self._evaluate(y_pred_retain, y_true_retain)
+
+        # 忘却クラスの精度（CNN）
+        if mask_forget.any():
+            top1_pred_forget = y_pred[mask_forget][:, 0]
+            true_forget = y_true[mask_forget]
+            forget_acc_cnn = np.around(
+                (top1_pred_forget == true_forget).sum() * 100.0 / len(true_forget),
+                decimals=2,
+            )
+        else:
+            forget_acc_cnn = None
+        
+        # 追加情報として dict に入れておく（trainer は今のままで OK）
+        cnn_accy["forget_top1"] = forget_acc_cnn
+        cnn_accy["num_retain_samples"] = int(mask_retain.sum())
+        cnn_accy["num_forget_samples"] = int(mask_forget.sum())
+
+        logging.info(
+            f"MU eval (CNN) - retain samples: {mask_retain.sum()}, "
+            f"forget samples: {mask_forget.sum()}"
+        )
+        logging.info(f"MU eval (CNN) - forget top1: {forget_acc_cnn}")
+
+        ### CNN の調和平均
+        retain_acc_cnn = cnn_accy["top1"]
+
+        if forget_acc_cnn is not None:
+            forget_err_cnn = 100.0 - forget_acc_cnn
+            if retain_acc_cnn + forget_err_cnn > 0:
+                hmean_cnn = 2.0 * retain_acc_cnn * forget_err_cnn / (retain_acc_cnn + forget_err_cnn)
+            else:
+                hmean_cnn = 0.0
+        else:
+            forget_err_cnn = None
+            hmean_cnn = None
+        
+        # dict に保存しておく（必要なら trainer から拾える）
+        cnn_accy["forget_err"] = forget_err_cnn
+        cnn_accy["hmean"] = hmean_cnn
+
+        logging.info(
+            f"MU (CNN) retain_acc={retain_acc_cnn:.2f}, "
+            f"forget_err={forget_err_cnn}, hmean={hmean_cnn}"
+        )
+
+        # -------------------------
+        # NME 評価（保持クラスだけ）
+        # -------------------------
+        nme_accy = None
+        y_pred_nme, y_true_nme = None, None
+
+        if hasattr(self, "_class_means"):
+            # class_means がある場合（通常の NME）
+            y_pred_nme, y_true_nme = self._eval_nme(self.test_loader, self._class_means)
+        elif hasattr(self, "_protos") and len(self._protos) > 0:
+            # protos を class means として使う場合
+            protos = np.asarray(list(self._protos.values()))
+            protos = protos / (np.linalg.norm(protos, axis=1, keepdims=True) + 1e-8)
+            y_pred_nme, y_true_nme = self._eval_nme(self.test_loader, protos)
+        
+        if y_pred_nme is not None:
+            y_true_nme = np.asarray(y_true_nme)
+
+            if len(forget_set) > 0:
+                mask_forget_nme = np.isin(y_true_nme, list(forget_set))
+            else:
+                mask_forget_nme = np.zeros_like(y_true_nme, dtype=bool)
+            mask_retain_nme = ~mask_forget_nme
+
+            # 保持クラスのみで NME の精度を計算
+            if mask_retain_nme.any():
+                y_pred_retain_nme = y_pred_nme[mask_retain_nme]
+                y_true_retain_nme = y_true_nme[mask_retain_nme]
+            else:
+                logging.warning(
+                    "MU eval (NME): no retain samples found, using all samples for metrics."
+                )
+                y_pred_retain_nme = y_pred_nme
+                y_true_retain_nme = y_true_nme
+
+            nme_accy = self._evaluate(y_pred_retain_nme, y_true_retain_nme)
+
+            # 忘却クラスの精度（NME）
+            if mask_forget_nme.any():
+                top1_pred_forget_nme = y_pred_nme[mask_forget_nme][:, 0]
+                true_forget_nme = y_true_nme[mask_forget_nme]
+                forget_acc_nme = np.around(
+                    (top1_pred_forget_nme == true_forget_nme).sum()
+                    * 100.0
+                    / len(true_forget_nme),
+                    decimals=2,
+                )
+            else:
+                forget_acc_nme = None
+
+            nme_accy["forget_top1"] = forget_acc_nme
+            nme_accy["num_retain_samples"] = int(mask_retain_nme.sum())
+            nme_accy["num_forget_samples"] = int(mask_forget_nme.sum())
+
+            logging.info(f"MU eval (NME) - forget top1: {forget_acc_nme}")
+
+            ### NME の調和平均
+            retain_acc_nme = nme_accy["top1"]  # 保持クラスのみで計算した top1 (%)
+
+            if forget_acc_nme is not None:
+                forget_err_nme = 100.0 - forget_acc_nme
+                if retain_acc_nme + forget_err_nme > 0:
+                    hmean_nme = 2.0 * retain_acc_nme * forget_err_nme / (retain_acc_nme + forget_err_nme)
+                else:
+                    hmean_nme = 0.0
+            else:
+                forget_err_nme = None
+                hmean_nme = None
+
+            nme_accy["forget_err"] = forget_err_nme
+            nme_accy["hmean"] = hmean_nme
+
+            logging.info(
+                f"MU (NME) retain_acc={retain_acc_nme:.2f}, "
+                f"forget_err={forget_err_nme}, hmean={hmean_nme}"
+            )
 
         return cnn_accy, nme_accy
+    
+    # def eval_task(self):
+    #     y_pred, y_true = self._eval_cnn(self.test_loader)
+    #     cnn_accy = self._evaluate(y_pred, y_true)
+
+    #     # MU 用の評価
+    #     forget_set = set(self.forget_classes)
+    #     y_true = np.asarray(y_true)
+    #     y_pred_top1 = y_pred[:, 0]
+
+    #     mask_forget = np.isin(y_true, list(forget_set))
+    #     mask_retain = ~mask_forget
+
+    #     if mask_forget.any():
+    #         acc_forget = (y_pred_top1[mask_forget] == y_true[mask_forget]).mean() * 100
+    #     else:
+    #         acc_forget = None
+
+    #     if mask_retain.any():
+    #         acc_retain = (y_pred_top1[mask_retain] == y_true[mask_retain]).mean() * 100
+    #     else:
+    #         acc_retain = None
+
+    #     logging.info(f"MU eval - forget classes: {self.forget_classes}")
+    #     logging.info(f"MU eval - forget acc: {acc_forget}, retain acc: {acc_retain}")
+
+    #     if hasattr(self, '_class_means'):
+    #         y_pred, y_true = self._eval_nme(self.test_loader, self._class_means)
+    #         nme_accy = self._evaluate(y_pred, y_true)
+    #     elif hasattr(self, '_protos'):
+    #         protos = list(self._protos.values())
+    #         y_pred, y_true = self._eval_nme(self.test_loader, protos/np.linalg.norm(protos,axis=1)[:,None])
+    #         nme_accy = self._evaluate(y_pred, y_true)
+    #     else:
+    #         nme_accy = None
+
+    #     return cnn_accy, nme_accy
+    
+
+    # def eval_task(self):
+    #     y_pred, y_true = self._eval_cnn(self.test_loader)
+    #     cnn_accy = self._evaluate(y_pred, y_true)
+
+    #     if hasattr(self, '_class_means'):
+    #         y_pred, y_true = self._eval_nme(self.test_loader, self._class_means)
+    #         nme_accy = self._evaluate(y_pred, y_true)
+    #     elif hasattr(self, '_protos'):
+    #         protos = list(self._protos.values())
+    #         y_pred, y_true = self._eval_nme(self.test_loader, protos/np.linalg.norm(protos,axis=1)[:,None])
+    #         nme_accy = self._evaluate(y_pred, y_true)
+    #     else:
+    #         nme_accy = None
+
+    #     return cnn_accy, nme_accy

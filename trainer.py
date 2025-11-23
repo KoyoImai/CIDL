@@ -28,7 +28,7 @@ def _train(args):
     # log name の決定
     # ===============================
     init_cls = 0 if args ["init_cls"] == args["increment"] else args["init_cls"]
-    logs_name = "logs/{}_v2/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
+    logs_name = "logs/{}/{}/{}/{}/{}".format(args["log_name"]args["model_name"],args["dataset"], init_cls, args['increment'])
     checkpoint_dir = "checkpoint/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
     
     # ===============================
@@ -39,7 +39,8 @@ def _train(args):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
-    logfilename = "logs/{}/{}/{}/{}/{}_{}_{}".format(
+    logfilename = "logs/{}/{}/{}/{}/{}/{}_{}_{}".format(
+        args["log_name"],
         args["model_name"],
         args["dataset"],
         init_cls,
@@ -113,6 +114,21 @@ def _train(args):
             logging.info("NME top1 curve: {}".format(nme_curve["top1"]))
             logging.info("average incremental accuracy: {}".format(np.mean(nme_curve["top1"])))
             logging.info("NME top5 curve: {}\n".format(nme_curve["top5"]))
+
+            logging.info(
+                "MU (CNN) - forget_top1: {}, forget_err: {}, hmean: {}".format(
+                    cnn_accy.get("forget_top1", None),
+                    cnn_accy.get("forget_err", None),
+                    cnn_accy.get("hmean", None),
+                )
+            )
+            logging.info(
+                "MU (NME) - forget_top1: {}, forget_err: {}, hmean: {}".format(
+                    nme_accy.get("forget_top1", None),
+                    nme_accy.get("forget_err", None),
+                    nme_accy.get("hmean", None),
+                )
+            )
         else:
             logging.info("No NME accuracy.")
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -123,6 +139,14 @@ def _train(args):
             logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
             logging.info("average incremental accuracy: {}".format(np.mean(cnn_curve["top1"])))
             logging.info("CNN top5 curve: {}\n".format(cnn_curve["top5"]))
+
+            logging.info(
+                "MU (CNN) - forget_top1: {}, forget_err: {}, hmean: {}".format(
+                    cnn_accy.get("forget_top1", None),
+                    cnn_accy.get("forget_err", None),
+                    cnn_accy.get("hmean", None),
+                )
+            )
         # if task == 10:
         #     test_dataset = data_manager.get_dataset(
         #         np.arange(0, 100), source='test', mode='test')

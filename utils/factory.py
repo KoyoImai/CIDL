@@ -14,6 +14,6 @@ def get_model(model_name, args):
     elif name == "prl":
         return PRL(args)
     elif name == "prl-mu":
-        assert False
+        return PRL_MU(args)
     else:
         assert 0
