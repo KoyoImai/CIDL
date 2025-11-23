@@ -195,7 +195,7 @@ class PRL_MU(BaseLearner):
                 aug_targets = torch.stack([targets * 4 + k for k in range(4)], 1).view(-1)
                 
                 # model にデータを入力 & 損失を計算
-                logits, loss_new, loss_fkd, loss_proto, loss_pes, loss_pkd = self._compute_prl_loss(inputs, targets, aug_targets)
+                logits, loss_new, loss_fkd, loss_proto, loss_pes, loss_pkd, loss_unl = self._compute_prl_loss(inputs, targets, aug_targets)
                 loss = loss_new + loss_fkd + loss_proto + loss_pes + loss_pkd
                 
                 # パラメータ更新
@@ -306,7 +306,7 @@ class PRL_MU(BaseLearner):
         loss_pkd = self.args["lambda_pgru"] * self._contras_loss(features, features_old)
 
         # =============================
-        # 旧クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
+        # 旧（維持）クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
         # =============================
         # 擬似 feature ベクトルを追加するリスト
         proto_features = []
@@ -356,8 +356,55 @@ class PRL_MU(BaseLearner):
         
         proto_logits = self._network_module_ptr.fc(proto_features)["logits"]
         loss_proto = self.args["lambda_proto"] * F.cross_entropy(proto_logits/self.args["temp"], proto_targets*4)
+        
+
+        # =============================
+        # 旧（忘却）クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
+        # =============================
+        loss_unl = torch.tensor(0., device=self._device)
+        lambda_unl = self.args["lambda_unl"]
+
+        if lambda_unl > 0 and len(self.forget_classes) > 0:
+
+            # 忘却クラスに属する prototypes のクラスIDだけを集める
+            forget_class_list = [c for c in self._protos.keys() if c in self.forget_classes]
+
+            if len(forget_class_list) > 0:
+                forget_features = []
+
+                # 保持クラスと同じ個数だけ忘却用擬似サンプルを作成
+                for _ in range(features.shape[0] // 4):
+                    i = np.random.randint(0, features.shape[0])
+                    np.random.shuffle(old_class_list)
+                    lam = np.random.beta(0.5, 0.5)
+                    if lam > 0.6:
+                        lam = lam * 0.6
+                    
+                    # 保持クラスと同じ mixup ルールで，忘却クラス proto と特徴を混ぜる
+                    if np.random.random() >= 0.5:
+                        temp = (1 + lam) * self._protos[forget_class_list[0]] - lam * features.detach().cpu().numpy()[i]
+                    else:
+                        temp = (1 - lam) * self._protos[forget_class_list[0]] + lam * features.detach().cpu().numpy()[i]
+
+                    forget_features.append(temp)
                 
-        return logits, loss_new, loss_fkd, loss_proto, torch.tensor(0.), loss_pkd
+                forget_features = torch.from_numpy(np.asarray(forget_features)).float().to(
+                    self._device, non_blocking=True
+                )
+
+                # 忘却 proto 擬似サンプルに対する logits
+                forget_logits = self._network_module_ptr.fc(forget_features)["logits"]
+
+                # 出力分布を一様に近づける（= エントロピー最大化）
+                log_p = F.log_softmax(forget_logits / self.args["temp"], dim=1)
+                num_classes = log_p.size(1)
+                uniform = torch.full_like(log_p, 1.0 / num_classes)
+
+                # KL(p || uniform) を最小化 → p を一様に近づける
+                loss_unl = lambda_unl * F.kl_div(log_p, uniform, reduction="batchmean")
+
+
+        return logits, loss_new, loss_fkd, loss_proto, torch.tensor(0.), loss_pkd, loss_unl
         
     
     def _compute_accuracy(self, model, loader):

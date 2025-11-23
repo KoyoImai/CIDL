@@ -9,7 +9,8 @@ class PES_Loss(nn.Module):
         self.lamda = lamda
 
     def forward(self, features, labels=None):
-        device = (torch.device('cuda') if features.is_cuda else torch.device('cpu'))
+        # device = (torch.device('cuda') if features.is_cuda else torch.device('cpu'))
+        device = features.device
 
         #  features are normalized
         features = F.normalize(features, p=2, dim=1)

@@ -28,7 +28,14 @@ def _train(args):
     # log name の決定
     # ===============================
     init_cls = 0 if args ["init_cls"] == args["increment"] else args["init_cls"]
-    logs_name = "logs/{}/{}/{}/{}/{}".format(args["log_name"]args["model_name"],args["dataset"], init_cls, args['increment'])
+    logs_name = "logs/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
+        args["model_name"],
+        args["log_name"],
+        args["dataset"],
+        init_cls,
+        args['increment'],
+        args["lambda_fkd"], args["lambda_proto"], args["lambda_pes"], args["lambda_pgru"], args["lambda_unl"],
+        )
     checkpoint_dir = "checkpoint/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
     
     # ===============================
@@ -39,15 +46,16 @@ def _train(args):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
-    logfilename = "logs/{}/{}/{}/{}/{}/{}_{}_{}".format(
-        args["log_name"],
+    logfilename = "logs/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/{}_{}_{}".format(
         args["model_name"],
+        args["log_name"],
         args["dataset"],
         init_cls,
         args["increment"],
         args["prefix"],
         args["seed"],
         args["convnet_type"],
+        args["lambda_fkd"], args["lambda_proto"], args["lambda_pes"], args["lambda_pgru"], args["lambda_unl"],
     )
 
     # ===============================
