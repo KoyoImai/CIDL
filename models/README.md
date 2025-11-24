@@ -20,10 +20,15 @@ models/
 ### BASELINE
 通常のNon Exampler Class Incremental Learning (NECIL) を実行するアプローチです．
 損失関数として，以下を採用しています．
+```
 - loss_new : 新しいタスクのデータに対する通常の交差エントロピー損失
 - loss_fkd : 新しいタスクのデータの特徴量に対するL2ノルムの蒸留損失
 - loss_proto : 過去タスクのクラスに対応したプロトタイプを使用した交差エントロピー損失
+```
 それぞれの損失に対する重みは，`CIDL/expsBASELINE/xxx.json`に記述する`lambda_xxx`から指定できます．
 対応する重みを以下に示します．
+```
 - lambda_fkd : loss_fkd（L2ノルムの蒸留損失）に対する重み（デフォルトは10）
 - lambda_proto : loss_proto（プロトタイプを使用した交差エントロピー損失）に対する重み（デフォルトは10）
+```
+
