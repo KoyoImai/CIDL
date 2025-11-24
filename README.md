@@ -16,6 +16,14 @@ SSOCL/
 
 ## 実行方法
 学習・評価の実行方法は以下の通りです．
+- CIFAR-100でbaselineを学習
+  ```
+  python main.py --config=exps/BASELINE/cifar.json
+  ```
+- CIFAR-100でMachine Unlearning用のbaselineを学習
+  ```
+  python main.py --config=exps/BASELINE_MU/cifar.json
+  ```
 - CIFAR-100で通常のPRLを学習
   ```
   python main.py --config=exps/PRL/cifar.json

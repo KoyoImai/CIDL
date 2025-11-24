@@ -1,6 +1,6 @@
 {
     "prefix": "train",
-    "log_name": "debug",
+    "log_name": "debug2",
     "dataset": "cifar100",
     "memory_size": 0,
     "shuffle": true,
@@ -25,7 +25,7 @@
     "lambda_proto": 10,
     "lambda_pes": 0.1,
     "lambda_pgru":2,
-    "lambda_unl": 1.0,
+    "lambda_unl": 0.0,
     "temp": 0.1,
     "init_epochs": 100,
     "epochs" : 100,

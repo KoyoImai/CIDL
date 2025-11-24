@@ -52,10 +52,10 @@ def _train(args):
         args["dataset"],
         init_cls,
         args["increment"],
+        args["lambda_fkd"], args["lambda_proto"], args["lambda_pes"], args["lambda_pgru"], args["lambda_unl"],
         args["prefix"],
         args["seed"],
         args["convnet_type"],
-        args["lambda_fkd"], args["lambda_proto"], args["lambda_pes"], args["lambda_pgru"], args["lambda_unl"],
     )
 
     # ===============================

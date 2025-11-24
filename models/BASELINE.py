@@ -19,7 +19,7 @@ import time
 EPSILON = 1e-8
 
 
-class PRL_MU(BaseLearner):
+class BASELINE(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
@@ -175,7 +175,7 @@ class PRL_MU(BaseLearner):
 
             # 記録用変数の初期化
             losses = 0.
-            losses_new, losses_fkd, losses_proto, losses_pes, losses_pkd, losses_unl = 0., 0., 0., 0., 0., 0.
+            losses_new, losses_fkd, losses_proto = 0., 0., 0.
             correct, total = 0, 0
 
             # 1エポック分の学習を実行
@@ -195,8 +195,8 @@ class PRL_MU(BaseLearner):
                 aug_targets = torch.stack([targets * 4 + k for k in range(4)], 1).view(-1)
                 
                 # model にデータを入力 & 損失を計算
-                logits, loss_new, loss_fkd, loss_proto, loss_pes, loss_pkd, loss_unl = self._compute_prl_loss(inputs, targets, aug_targets)
-                loss = loss_new + loss_fkd + loss_proto + loss_pes + loss_pkd + loss_unl
+                logits, loss_new, loss_fkd, loss_proto = self._compute_prl_loss(inputs, targets, aug_targets)
+                loss = loss_new + loss_fkd + loss_proto
                 
                 # パラメータ更新
                 optimizer.zero_grad()
@@ -208,9 +208,6 @@ class PRL_MU(BaseLearner):
                 losses_new += loss_new.item()
                 losses_fkd += loss_fkd.item()
                 losses_proto += loss_proto.item()
-                losses_pes += loss_pes.item()
-                losses_pkd += loss_pkd.item()
-                losses_unl += loss_unl.item()
 
                 # 正解率の計算
                 _, preds = torch.max(logits, dim=1)
@@ -224,12 +221,12 @@ class PRL_MU(BaseLearner):
             
             # 5 epoch 毎に精度や損失などを表示
             if epoch % 5 != 0:
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_iic {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_pkd {:.3f}, Loss_unl {:.3f} Train_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_pes/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_pkd/len(train_loader), losses_unl/len(train_loader), train_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Train_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), train_acc)
             else:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_iic {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_pkd {:.3f}, loss_unl {:.3f} Train_accy {:.2f}, Test_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_pes/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_pkd/len(train_loader), losses_pkd/len(train_loader), train_acc, test_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), train_acc, test_acc)
             prog_bar.set_description(info)
             logging.info(info)
 
@@ -290,8 +287,7 @@ class PRL_MU(BaseLearner):
         # ベースタスクの場合，交差エントロピー損失とPES損失だけ計算
         # =============================
         if self._cur_task == 0:
-            loss_iic = self.args["lambda_pes"] * self.pes_loss_func(features, pes_targets)
-            return logits, loss_new, torch.tensor(0.), torch.tensor(0.), loss_iic, torch.tensor(0.), torch.tensor(0.)
+            return logits, loss_new, torch.tensor(0.), torch.tensor(0.)
         
         # 過去モデルの特徴量を取り出す
         features_old = self.old_network_module_ptr.extract_vector(inputs)
@@ -300,14 +296,9 @@ class PRL_MU(BaseLearner):
         # L2損失による蒸留損失
         # =============================
         loss_fkd = self.args["lambda_fkd"] * torch.dist(features, features_old, 2)
-        
-        # =============================
-        # PGRU損失（直交損失と整合損失）
-        # =============================
-        loss_pkd = self.args["lambda_pgru"] * self._contras_loss(features, features_old)
 
         # =============================
-        # 旧（維持）クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
+        # 旧クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
         # =============================
         # 擬似 feature ベクトルを追加するリスト
         proto_features = []
@@ -316,17 +307,7 @@ class PRL_MU(BaseLearner):
         proto_targets = []
 
         # 旧タスクに存在するラベルのリスト
-        # print("self.forget_classes: ", self.forget_classes)
         old_class_list = list(self._protos.keys())
-        # print("old_class_list 1: ", old_class_list)
-
-        # 旧タスクのラベルリストから忘却対象のクラスを除外する
-        old_class_list = [c for c in old_class_list if c not in self.forget_classes]
-        # print("old_class_list 2: ", old_class_list)
-
-        if len(old_class_list) == 0:
-            loss_proto = torch.tensor(0., device=self._device)
-            return logits, loss_new, loss_fkd, loss_proto, torch.tensor(0., device=self._device), loss_pkd
 
         # バッチサイズ分だけサンプルを作成する
         for _ in range(features.shape[0]//4): # batch_size = feature.shape[0] // 4
@@ -359,53 +340,7 @@ class PRL_MU(BaseLearner):
         loss_proto = self.args["lambda_proto"] * F.cross_entropy(proto_logits/self.args["temp"], proto_targets*4)
         
 
-        # =============================
-        # 旧（忘却）クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
-        # =============================
-        loss_unl = torch.tensor(0., device=self._device)
-        lambda_unl = self.args["lambda_unl"]
-
-        if lambda_unl > 0 and len(self.forget_classes) > 0:
-
-            # 忘却クラスに属する prototypes のクラスIDだけを集める
-            forget_class_list = [c for c in self._protos.keys() if c in self.forget_classes]
-
-            if len(forget_class_list) > 0:
-                forget_features = []
-
-                # 保持クラスと同じ個数だけ忘却用擬似サンプルを作成
-                for _ in range(features.shape[0] // 4):
-                    i = np.random.randint(0, features.shape[0])
-                    np.random.shuffle(old_class_list)
-                    lam = np.random.beta(0.5, 0.5)
-                    if lam > 0.6:
-                        lam = lam * 0.6
-                    
-                    # 保持クラスと同じ mixup ルールで，忘却クラス proto と特徴を混ぜる
-                    if np.random.random() >= 0.5:
-                        temp = (1 + lam) * self._protos[forget_class_list[0]] - lam * features.detach().cpu().numpy()[i]
-                    else:
-                        temp = (1 - lam) * self._protos[forget_class_list[0]] + lam * features.detach().cpu().numpy()[i]
-
-                    forget_features.append(temp)
-                
-                forget_features = torch.from_numpy(np.asarray(forget_features)).float().to(
-                    self._device, non_blocking=True
-                )
-
-                # 忘却 proto 擬似サンプルに対する logits
-                forget_logits = self._network_module_ptr.fc(forget_features)["logits"]
-
-                # 出力分布を一様に近づける（= エントロピー最大化）
-                log_p = F.log_softmax(forget_logits / self.args["temp"], dim=1)
-                num_classes = log_p.size(1)
-                uniform = torch.full_like(log_p, 1.0 / num_classes)
-
-                # KL(p || uniform) を最小化 → p を一様に近づける
-                loss_unl = lambda_unl * F.kl_div(log_p, uniform, reduction="batchmean")
-
-
-        return logits, loss_new, loss_fkd, loss_proto, torch.tensor(0.), loss_pkd, loss_unl
+        return logits, loss_new, loss_fkd, loss_proto
         
     
     def _compute_accuracy(self, model, loader):
