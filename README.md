@@ -41,7 +41,7 @@ SSOCL/
   ```
 
 ### Tiny-ImageNetの実行
-[tiny-imagenet-200]([here](https://mega.nz/file/9ikj1bbB#Zax1V7Q1xPlkxu8C9bOq8Ocq6WAu_-jtyqvta2hkTN0))をダウンロードして，`utils/data.py`で指定されるディレクトリに配置してください．
+[tiny-imagenet-200](https://mega.nz/file/9ikj1bbB#Zax1V7Q1xPlkxu8C9bOq8Ocq6WAu_-jtyqvta2hkTN0)をダウンロードして，`utils/data.py`で指定されるディレクトリに配置してください．
 - Tiny-ImageNetでbaselineを学習
   ```
   python main.py --config=exps/BASELINE/tiny.json
