@@ -5,12 +5,13 @@
 学習・評価に使用するプログラムの全体像は以下の通りです．
 ```
 SSOCL/
-├── convs       : データ拡張関連を実装したモジュール群
-├── exps        : 学習・評価の設定を記述する.yamlファイルの格納場所．
-├── models      : model関連を実装したモジュール群．
-├── utils       : Optimizer関連を実装したモジュール群．
-├── main.py     : 訓練・評価を実際に行うモジュール群．
-└── trainer.py  : その他のモジュールを実装するutilsファイル．
+├── convs                    : データ拡張関連を実装したモジュール群
+├── exps                     : 学習・評価の設定を記述する.yamlファイルの格納場所．
+├── models                   : model関連を実装したモジュール群．
+├── utils                    : Optimizer関連を実装したモジュール群．
+├── main.py                  : 訓練・評価を実際に行うモジュール群．
+├── reconstruction.ipynb     : 学習済みモデルが出力特徴から画像を再構成するノートブック．
+└── trainer.py               : その他のモジュールを実装するutilsファイル．
 ```
 
 
@@ -50,6 +51,16 @@ SSOCL/
   ```
   python main.py --config=exps/BASELINE_MU/tiny.json
   ```
+
+
+### 分析・調査用
+リプレイバッファありの学習．
+忘却クラスのデータが使用可能と仮定し，どのような損失ならbackbone側の知識を削除できるかを確かめるために使用する．
+- CIFAR-100でbaseline-replayを学習
+  ```
+  python main.py --config=exps/BASELINE_replay/cifar.json
+  ```
+
 
 ### ImageNet100
 現在実装中です．

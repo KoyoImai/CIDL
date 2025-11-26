@@ -19,13 +19,15 @@ import time
 EPSILON = 1e-8
 
 
-class BASELINE_MU(BaseLearner):
+class BASELINE_replay(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
 
         # backbone model の獲得
         self._network = IncrementalNet(args, False)
+        self._memory_data = []
+        self._memory_targets = []
         
         # プロトタイプの初期化
         self._protos = {}
@@ -33,6 +35,7 @@ class BASELINE_MU(BaseLearner):
         # 忘却クラスの初期化
         self.forget_classes = []                # 現在タスクで忘却する対象クラスのリスト
         self.forget_list = args["forget_cls"]   # 将来忘却をするクラスのリスト
+        self.forget_classes = []                # 累積
 
         # データセットのサイズを設定
         if "cifar" in self.args["dataset"]:
@@ -48,13 +51,30 @@ class BASELINE_MU(BaseLearner):
     
 
     def after_task(self):
+
+        # これまでに学習したクラス数の更新
         self._known_classes = self._total_classes
+        
+        # 知識蒸留用の過去モデルを更新
         self._old_network = self._network.copy().freeze()
         if hasattr(self._old_network,"module"):
             self.old_network_module_ptr = self._old_network.module
         else:
             self.old_network_module_ptr = self._old_network
         
+        # リプレイバッファの更新
+        if self._memory_size > 0 and self.data_manager is not None:
+            
+            # 1 クラスあたり何サンプル保持するか
+            if self._memory_per_class is not None:
+                m = self._memory_per_class
+            else:
+                m = self._memory_size // self._known_classes
+
+            logging.info(f"Update replay memory: m={m} per class")
+            self.build_rehearsal_memory(self.data_manager, m)
+
+        # チェックポイントの保存
         self.save_checkpoint("checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
             self.args["model_name"],
             self.args["log_name"],

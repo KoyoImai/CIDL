@@ -66,7 +66,8 @@ class BaseLearner(object):
         if self._fixed_memory:
             self._construct_exemplar_unified(data_manager, per_class)
         else:
-            self._reduce_exemplar(data_manager, per_class)
+            if len(self._data_memory) != 0:
+                self._reduce_exemplar(data_manager, per_class)
             self._construct_exemplar(data_manager, per_class)
 
     def save_checkpoint(self, filename):
@@ -75,6 +76,18 @@ class BaseLearner(object):
             "tasks": self._cur_task,
             "model_state_dict": self._network.state_dict(),
         }
+        # プロトタイプを保存（あれば）
+        if hasattr(self, "_protos"):
+            save_dict["protos"] = self._protos
+
+        # MU 用の forget クラスも保存（あれば）
+        if hasattr(self, "forget_classes"):
+            save_dict["forget_classes"] = self.forget_classes
+
+        # class_order を保存
+        if getattr(self, "_class_order", None) is not None:
+            save_dict["class_order"] = self._class_order
+
         torch.save(save_dict, "{}/phase{}.pkl".format(filename, self._cur_task))
 
     def after_task(self):

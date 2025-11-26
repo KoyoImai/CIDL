@@ -195,6 +195,9 @@ class DataManager(object):
             new_idxes = np.where(np.logical_and(y >= low_range, y < high_range))[0]
         return x[new_idxes], y[new_idxes]
 
+    def get_class_order(self):
+        return self._class_order
+
     def getlen(self, index):
         y = self._train_targets
         return np.sum(np.where(y == index))

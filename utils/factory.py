@@ -4,7 +4,7 @@ from models.PRL2 import PRL2
 from models.PRL_MU import PRL_MU
 from models.BASELINE import BASELINE
 from models.BASELINE_MU import BASELINE_MU
-
+from models.BASELINE_replay import BASELINE_replay
 
 def get_model(model_name, args):
 
@@ -24,5 +24,7 @@ def get_model(model_name, args):
         return BASELINE_MU(args)
     elif name == "prl2":
         return PRL2(args)
+    elif name == "baseline-replay":
+        return BASELINE_replay(args)
     else:
         assert 0

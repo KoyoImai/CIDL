@@ -70,6 +70,9 @@ class PRL_MU(BaseLearner):
         self.data_manager = data_manager
         self._cur_task += 1
 
+        # 元ラベルの順序
+        self._class_order = data_manager.get_class_order()
+
         # 2タスク目で AutoEncoder を作成
         if self._cur_task == 1:
             self.old_ae = AutoencoderSigmoid(code_dims=512)
