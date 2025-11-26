@@ -51,7 +51,14 @@ SSOCL/
   ```
   python main.py --config=exps/BASELINE_MU/tiny.json
   ```
-
+- Tiny-ImageNetで通常のPRL2を学習
+  ```
+  python main.py --config=exps/PRL2/tiny.json
+  ```
+- Tiny-ImageNetでMachine Unlearning用に調整したPRLを学習
+  ```
+  python main.py --config=exps/PRL_MU/tiny.json
+  ```
 
 ### 分析・調査用
 リプレイバッファありの学習．

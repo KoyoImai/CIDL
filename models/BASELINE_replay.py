@@ -205,7 +205,7 @@ class BASELINE_replay(BaseLearner):
 
             # 記録用変数の初期化
             losses = 0.
-            losses_new, losses_fkd, losses_proto, losses_unl = 0., 0., 0., 0.
+            losses_new, losses_fkd, losses_proto, losses_unl, losses_unl_mem = 0., 0., 0., 0., 0.
             correct, total = 0, 0
 
             # 1エポック分の学習を実行
@@ -225,8 +225,8 @@ class BASELINE_replay(BaseLearner):
                 aug_targets = torch.stack([targets * 4 + k for k in range(4)], 1).view(-1)
                 
                 # model にデータを入力 & 損失を計算
-                logits, loss_new, loss_fkd, loss_proto, loss_unl = self._compute_prl_loss(inputs, targets, aug_targets)
-                loss = loss_new + loss_fkd + loss_proto + loss_unl
+                logits, loss_new, loss_fkd, loss_proto, loss_unl, loss_unl_mem = self._compute_prl_loss(inputs, targets, aug_targets)
+                loss = loss_new + loss_fkd + loss_proto + loss_unl + loss_unl_mem
                 
                 # パラメータ更新
                 optimizer.zero_grad()
@@ -239,6 +239,7 @@ class BASELINE_replay(BaseLearner):
                 losses_fkd += loss_fkd.item()
                 losses_proto += loss_proto.item()
                 losses_unl += loss_unl.item()
+                losses_unl_mem += loss_unl_mem.item()
 
                 # 正解率の計算
                 _, preds = torch.max(logits, dim=1)
@@ -252,12 +253,12 @@ class BASELINE_replay(BaseLearner):
             
             # 5 epoch 毎に精度や損失などを表示
             if epoch % 5 != 0:
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Train_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), train_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Loss_mem {:.3f}, Train_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_unl/len(train_loader), losses_unl_mem/len(train_loader), train_acc)
             else:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), train_acc, test_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Loss_mem {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_unl/len(train_loader), losses_unl_mem/len(train_loader), train_acc, test_acc)
             prog_bar.set_description(info)
             logging.info(info)
 
@@ -318,7 +319,7 @@ class BASELINE_replay(BaseLearner):
         # ベースタスクの場合，交差エントロピー損失だけ計算
         # =============================
         if self._cur_task == 0:
-            return logits, loss_new, torch.tensor(0.), torch.tensor(0.), torch.tensor(0.)
+            return logits, loss_new, torch.tensor(0.), torch.tensor(0.), torch.tensor(0.), torch.tensor(0., device=self._device)
         
         # 過去モデルの特徴量を取り出す
         features_old = self.old_network_module_ptr.extract_vector(inputs)
@@ -348,7 +349,7 @@ class BASELINE_replay(BaseLearner):
 
         if len(old_class_list) == 0:
             loss_proto = torch.tensor(0., device=self._device)
-            return logits, loss_new, loss_fkd, loss_proto, torch.tensor(0., device=self._device)
+            return logits, loss_new, loss_fkd, loss_proto, torch.tensor(0., device=self._device), torch.tensor(0., device=self._device)
 
         # バッチサイズ分だけサンプルを作成する
         for _ in range(features.shape[0]//4): # batch_size = feature.shape[0] // 4
@@ -382,13 +383,17 @@ class BASELINE_replay(BaseLearner):
         
 
         # =============================
-        # 旧（忘却）クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
+        # 旧（忘却）クラスに対する忘却損失
+        #   - (A) prototype ベースの擬似サンプル
+        #   - (B) メモリ中の生画像サンプル
         # =============================
         loss_unl = torch.tensor(0., device=self._device)
+        loss_unl_mem = torch.tensor(0., device=self._device)
         lambda_unl = self.args["lambda_unl"]
 
         if lambda_unl > 0 and len(self.forget_classes) > 0:
-
+            
+            # ---------- (A) 既存: prototype ベース ----------
             # 忘却クラスに属する prototypes のクラスIDだけを集める
             forget_class_list = [c for c in self._protos.keys() if c in self.forget_classes]
 
@@ -425,9 +430,36 @@ class BASELINE_replay(BaseLearner):
 
                 # KL(p || uniform) を最小化 → p を一様に近づける
                 loss_unl = lambda_unl * F.kl_div(log_p, uniform, reduction="batchmean")
-        
 
-        return logits, loss_new, loss_fkd, loss_proto, loss_unl
+            # ---------- (B) 新規: self._data_memory 由来の忘却サンプル ----------
+            # メモリが空でなければ，forget クラスだけを抜き出して 1 バッチ作る
+            # print("len(self._data_memory): ", len(self._data_memory))
+            # print("self._data_memory: ", self._data_memory)
+            # print("self._data_memory.shape: ", self._data_memory.shape)
+            # print("self._targets_memory.shape: ", self._targets_memory.shape)
+            # assert False
+
+            if hasattr(self, "_data_memory") and len(self._data_memory) > 0:
+                
+                mem_inputs, mem_targets = self._sample_forget_memory_batch(20)
+                # print("mem_targets: ", mem_targets)
+
+                if mem_inputs is not None:
+
+                    mem_features = self._network_module_ptr.extract_vector(mem_inputs)
+                    mem_logits = self._network_module_ptr.fc(mem_features)["logits"]
+
+                    log_p_mem = F.log_softmax(mem_logits / self.args["temp"], dim=1)
+                    num_classes = log_p_mem.size(1)
+                    uniform = torch.full_like(log_p_mem, 1.0 / num_classes)
+
+                    loss_unl_mem = F.kl_div(
+                        log_p_mem, uniform, reduction="batchmean"
+                    )
+                    loss_unl_mem = lambda_unl * loss_unl_mem
+
+
+        return logits, loss_new, loss_fkd, loss_proto, loss_unl, loss_unl_mem
         
     
     def _compute_accuracy(self, model, loader):
@@ -535,10 +567,7 @@ class BASELINE_replay(BaseLearner):
         nme_accy = None
         y_pred_nme, y_true_nme = None, None
 
-        if hasattr(self, "_class_means"):
-            # class_means がある場合（通常の NME）
-            y_pred_nme, y_true_nme = self._eval_nme(self.test_loader, self._class_means)
-        elif hasattr(self, "_protos") and len(self._protos) > 0:
+        if hasattr(self, "_protos") and len(self._protos) > 0:
             # protos を class means として使う場合
             protos = np.asarray(list(self._protos.values()))
             protos = protos / (np.linalg.norm(protos, axis=1, keepdims=True) + 1e-8)
@@ -607,57 +636,99 @@ class BASELINE_replay(BaseLearner):
             )
 
         return cnn_accy, nme_accy
-    
-    # def eval_task(self):
-    #     y_pred, y_true = self._eval_cnn(self.test_loader)
-    #     cnn_accy = self._evaluate(y_pred, y_true)
+   
 
-    #     # MU 用の評価
-    #     forget_set = set(self.forget_classes)
-    #     y_true = np.asarray(y_true)
-    #     y_pred_top1 = y_pred[:, 0]
+    def _sample_forget_memory_batch(self, num_samples):
+        """
+        self._data_memory / self._targets_memory から
+        self.forget_classes に属するサンプルだけをランダムに num_samples 個取り出して
+        1 バッチ分の (inputs, targets) を返す。
 
-    #     mask_forget = np.isin(y_true, list(forget_set))
-    #     mask_retain = ~mask_forget
+        メモリ or 忘却クラスが空のときは (None, None) を返す。
+        """
+        # メモリがまだ空なら何もしない
+        if not hasattr(self, "_data_memory") or self._data_memory.size == 0:
+            return None, None
 
-    #     if mask_forget.any():
-    #         acc_forget = (y_pred_top1[mask_forget] == y_true[mask_forget]).mean() * 100
-    #     else:
-    #         acc_forget = None
+        # 忘却クラスが指定されていない場合
+        if len(self.forget_classes) == 0:
+            return None, None
 
-    #     if mask_retain.any():
-    #         acc_retain = (y_pred_top1[mask_retain] == y_true[mask_retain]).mean() * 100
-    #     else:
-    #         acc_retain = None
+        # numpy の targets から forget クラスに属する index を抜き出す
+        mask = np.isin(self._targets_memory, np.array(self.forget_classes))
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0:
+            return None, None
 
-    #     logging.info(f"MU eval - forget classes: {self.forget_classes}")
-    #     logging.info(f"MU eval - forget acc: {acc_forget}, retain acc: {acc_retain}")
+        num = min(num_samples, len(idxs))
+        sampled = np.random.choice(idxs, size=num, replace=False)
 
-    #     if hasattr(self, '_class_means'):
-    #         y_pred, y_true = self._eval_nme(self.test_loader, self._class_means)
-    #         nme_accy = self._evaluate(y_pred, y_true)
-    #     elif hasattr(self, '_protos'):
-    #         protos = list(self._protos.values())
-    #         y_pred, y_true = self._eval_nme(self.test_loader, protos/np.linalg.norm(protos,axis=1)[:,None])
-    #         nme_accy = self._evaluate(y_pred, y_true)
-    #     else:
-    #         nme_accy = None
+        forget_data = self._data_memory[sampled]
+        forget_targets = self._targets_memory[sampled]
 
-    #     return cnn_accy, nme_accy
-    
+        # DataManager 経由で Dataset を作って，普段と同じ transform をかける
+        forget_dataset = self.data_manager.get_dataset(
+            [],                           # 元データからは何も取らない
+            source="train",
+            mode="test",                  # ここは test / train どちらでもよいが，とりあえず test で固定
+            appendent=(forget_data, forget_targets),
+        )
+        forget_loader = DataLoader(
+            forget_dataset,
+            batch_size=num,
+            shuffle=False,
+            num_workers=self.args["num_workers"],
+            pin_memory=True,
+        )
 
-    # def eval_task(self):
-    #     y_pred, y_true = self._eval_cnn(self.test_loader)
-    #     cnn_accy = self._evaluate(y_pred, y_true)
+        # 1 バッチだけ取り出す
+        _, inputs, targets = next(iter(forget_loader))
+        inputs = inputs.to(self._device, non_blocking=True)
+        targets = targets.to(self._device, non_blocking=True)
+        return inputs, targets
 
-    #     if hasattr(self, '_class_means'):
-    #         y_pred, y_true = self._eval_nme(self.test_loader, self._class_means)
-    #         nme_accy = self._evaluate(y_pred, y_true)
-    #     elif hasattr(self, '_protos'):
-    #         protos = list(self._protos.values())
-    #         y_pred, y_true = self._eval_nme(self.test_loader, protos/np.linalg.norm(protos,axis=1)[:,None])
-    #         nme_accy = self._evaluate(y_pred, y_true)
-    #     else:
-    #         nme_accy = None
 
-    #     return cnn_accy, nme_accy
+    def build_rehearsal_memory(self, data_manager, per_class):
+        """
+        BaseLearner の iCaRL 風 exemplar 構築は使わず、
+        単純に「各クラスから per_class 個ランダムサンプル」を
+        self._data_memory / self._targets_memory に入れるだけの
+        シンプルな replay メモリ構築。
+
+        ・_class_means は一切作らない
+        ・NME は self._protos を使うので問題なし
+        """
+        m = per_class  # 1 クラスあたりのメモリ数
+
+        all_exemplars = []
+        all_labels = []
+
+        for class_idx in range(self._total_classes):
+            # このクラスの train データを全部取り出す
+            data, targets, _ = data_manager.get_dataset(
+                np.arange(class_idx, class_idx + 1),
+                source="train",
+                mode="test",
+                ret_data=True,
+            )
+            if len(data) == 0:
+                continue
+
+            # 最大 m 個までランダムサンプリング
+            num = min(m, len(data))
+            inds = np.random.choice(len(data), size=num, replace=False)
+
+            all_exemplars.append(data[inds])
+            all_labels.append(targets[inds])
+
+        if len(all_exemplars) > 0:
+            self._data_memory = np.concatenate(all_exemplars)
+            self._targets_memory = np.concatenate(all_labels)
+        else:
+            self._data_memory = np.array([])
+            self._targets_memory = np.array([])
+
+        logging.info(
+            f"[Replay] Stored {len(self._targets_memory)} exemplars "
+            f"({m} per class for {self._total_classes} classes)."
+        )

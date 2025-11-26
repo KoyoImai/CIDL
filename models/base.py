@@ -68,6 +68,8 @@ class BaseLearner(object):
         else:
             if len(self._data_memory) != 0:
                 self._reduce_exemplar(data_manager, per_class)
+            else:
+                self._class_means = np.zeros((self._total_classes, self.feature_dim))
             self._construct_exemplar(data_manager, per_class)
 
     def save_checkpoint(self, filename):
@@ -226,7 +228,19 @@ class BaseLearner(object):
 
     def _construct_exemplar(self, data_manager, m):
         logging.info("Constructing exemplars...({} per classes)".format(m))
-        for class_idx in range(self._known_classes, self._total_classes):
+        # print("self._known_classes: ", self._known_classes)   # self._known_classes:  50
+        # print("self._total_classes: ", self._total_classes)   # self._total_classes:  50
+
+        if self._known_classes == self._total_classes and hasattr(self, "_cur_task") and self._cur_task >= 0:
+        # 今回のタスクで増えたクラス数（例: 50, 5, 5, ...）
+            num_new = data_manager.get_task_size(self._cur_task)
+            start_class = self._total_classes - num_new
+        else:
+            # 元の想定通りのケース（_known_classes が「旧クラス数」になっている場合）
+            start_class = self._known_classes
+
+        # ここで start_class 〜 self._total_classes-1 が「このタスクで扱うクラス」
+        for class_idx in range(start_class, self._total_classes):
             data, targets, idx_dataset = data_manager.get_dataset(
                 np.arange(class_idx, class_idx + 1),
                 source="train",
@@ -278,6 +292,8 @@ class BaseLearner(object):
                 else exemplar_targets
             )
 
+            # print("self._targets_memory: ", self._targets_memory)
+
             # Exemplar mean
             idx_dataset = data_manager.get_dataset(
                 [],
@@ -294,6 +310,11 @@ class BaseLearner(object):
             mean = mean / np.linalg.norm(mean)
 
             self._class_means[class_idx, :] = mean
+        
+        # print("self._data_memory.shape: ", self._data_memory.shape)
+        # print("self._targets_memory.shape: ", self._targets_memory.shape)
+        # assert False
+
 
     def _construct_exemplar_unified(self, data_manager, m):
         logging.info(
