@@ -145,8 +145,8 @@ class iTinyImageNet200(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        train_dir = "/data0/CL_data/tiny-imagenet-200/train/"
-        test_dir = "/data0/CL_data/tiny-imagenet-200/val/"
+        train_dir = "/home/kouyou/datasets/tiny-imagenet-200/train/"
+        test_dir = "/home/kouyou/datasets//tiny-imagenet-200/val/"
 
         train_dset = datasets.ImageFolder(train_dir)
         # test_dset = datasets.ImageFolder(test_dir)

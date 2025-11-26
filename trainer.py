@@ -36,7 +36,14 @@ def _train(args):
         args['increment'],
         args["lambda_fkd"], args["lambda_proto"], args["lambda_pes"], args["lambda_pgru"], args["lambda_unl"],
         )
-    checkpoint_dir = "checkpoint/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
+    checkpoint_dir = "checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
+        args["model_name"],
+        args["log_name"],
+        args["dataset"],
+        init_cls,
+        args['increment'],
+        args["lambda_fkd"], args["lambda_proto"], args["lambda_pes"], args["lambda_pgru"], args["lambda_unl"],
+        )
     
     # ===============================
     # ディレクトリの作成

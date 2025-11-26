@@ -54,8 +54,15 @@ class BASELINE_MU(BaseLearner):
             self.old_network_module_ptr = self._old_network.module
         else:
             self.old_network_module_ptr = self._old_network
-        self.save_checkpoint("checkpoint/{}/{}/{}/{}".format(self.args["model_name"],self.args["dataset"],self.args["init_cls"],self.args["increment"]))
-
+        
+        self.save_checkpoint("checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
+            self.args["model_name"],
+            self.args["log_name"],
+            self.args["dataset"],
+            self.args["init_cls"],
+            self.args["increment"],
+            self.args["lambda_fkd"], self.args["lambda_proto"], self.args["lambda_pes"], self.args["lambda_pgru"], self.args["lambda_unl"],)
+        )
     def incremental_train(self, data_manager):
         
         # data_managerの登録

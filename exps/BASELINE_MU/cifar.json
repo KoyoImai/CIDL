@@ -1,6 +1,6 @@
 {
     "prefix": "train",
-    "log_name": "debug",
+    "log_name": "baseline",
     "dataset": "cifar100",
     "memory_size": 0,
     "shuffle": true,

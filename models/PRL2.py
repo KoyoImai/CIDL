@@ -19,7 +19,7 @@ import time
 EPSILON = 1e-8
 
 
-class BASELINE(BaseLearner):
+class PRL2(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
@@ -183,7 +183,7 @@ class BASELINE(BaseLearner):
 
             # 記録用変数の初期化
             losses = 0.
-            losses_new, losses_fkd, losses_proto = 0., 0., 0.
+            losses_new, losses_fkd, losses_proto, losses_pes, losses_pkd, losses_unl = 0., 0., 0., 0., 0., 0.
             correct, total = 0, 0
 
             # 1エポック分の学習を実行
@@ -203,8 +203,8 @@ class BASELINE(BaseLearner):
                 aug_targets = torch.stack([targets * 4 + k for k in range(4)], 1).view(-1)
                 
                 # model にデータを入力 & 損失を計算
-                logits, loss_new, loss_fkd, loss_proto = self._compute_prl_loss(inputs, targets, aug_targets)
-                loss = loss_new + loss_fkd + loss_proto
+                logits, loss_new, loss_fkd, loss_proto, loss_pes, loss_pkd = self._compute_prl_loss(inputs, targets, aug_targets)
+                loss = loss_new + loss_fkd + loss_proto + loss_pes + loss_pkd
                 
                 # パラメータ更新
                 optimizer.zero_grad()
@@ -216,6 +216,9 @@ class BASELINE(BaseLearner):
                 losses_new += loss_new.item()
                 losses_fkd += loss_fkd.item()
                 losses_proto += loss_proto.item()
+                losses_pes += loss_pes.item()
+                losses_pkd += loss_pkd.item()
+
 
                 # 正解率の計算
                 _, preds = torch.max(logits, dim=1)
@@ -229,12 +232,12 @@ class BASELINE(BaseLearner):
             
             # 5 epoch 毎に精度や損失などを表示
             if epoch % 5 != 0:
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Train_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), train_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_iic {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_pkd {:.3f}, Train_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_pes/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_pkd/len(train_loader), train_acc)
             else:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), train_acc, test_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_iic {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_pkd {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_pes/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_pkd/len(train_loader), train_acc, test_acc)
             prog_bar.set_description(info)
             logging.info(info)
 
@@ -295,7 +298,8 @@ class BASELINE(BaseLearner):
         # ベースタスクの場合，交差エントロピー損失とPES損失だけ計算
         # =============================
         if self._cur_task == 0:
-            return logits, loss_new, torch.tensor(0.), torch.tensor(0.)
+            loss_iic = self.args["lambda_pes"] * self.pes_loss_func(features, pes_targets)
+            return logits, loss_new, torch.tensor(0.), torch.tensor(0.), loss_iic, torch.tensor(0.)
         
         # 過去モデルの特徴量を取り出す
         features_old = self.old_network_module_ptr.extract_vector(inputs)
@@ -304,9 +308,14 @@ class BASELINE(BaseLearner):
         # L2損失による蒸留損失
         # =============================
         loss_fkd = self.args["lambda_fkd"] * torch.dist(features, features_old, 2)
+        
+        # =============================
+        # PGRU損失（直交損失と整合損失）
+        # =============================
+        loss_pkd = self.args["lambda_pgru"] * self._contras_loss(features, features_old)
 
         # =============================
-        # 旧クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
+        # 旧（維持）クラスの prototype とミニバッチのサンプルの feature を混ぜて 交差エントロピー損失を計算
         # =============================
         # 擬似 feature ベクトルを追加するリスト
         proto_features = []
@@ -315,6 +324,7 @@ class BASELINE(BaseLearner):
         proto_targets = []
 
         # 旧タスクに存在するラベルのリスト
+        # print("self.forget_classes: ", self.forget_classes)
         old_class_list = list(self._protos.keys())
 
         # バッチサイズ分だけサンプルを作成する
@@ -348,7 +358,7 @@ class BASELINE(BaseLearner):
         loss_proto = self.args["lambda_proto"] * F.cross_entropy(proto_logits/self.args["temp"], proto_targets*4)
         
 
-        return logits, loss_new, loss_fkd, loss_proto
+        return logits, loss_new, loss_fkd, loss_proto, torch.tensor(0.), loss_pkd
         
     
     def _compute_accuracy(self, model, loader):
