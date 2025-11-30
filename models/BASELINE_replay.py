@@ -32,10 +32,10 @@ class BASELINE_replay(BaseLearner):
         # プロトタイプの初期化
         self._protos = {}
 
-        # 忘却クラスの初期化
-        self.forget_classes = []                # 現在タスクで忘却する対象クラスのリスト
-        self.forget_list = args["forget_cls"]   # 将来忘却をするクラスのリスト
-        self.forget_classes = []                # 累積
+        # 忘却クラス関連
+        self.forget_list = args["forget_cls"]   # タスクごとの忘却予定クラスリスト（外から与えられる）
+        self.forget_classes = []                # これまでの全タスクで忘却済みのクラス（累積）
+        self.cur_forget_classes = []            # このタスクで新たに忘却するクラス
 
         # データセットのサイズを設定
         if "cifar" in self.args["dataset"]:
@@ -102,9 +102,16 @@ class BASELINE_replay(BaseLearner):
             data_manager.get_task_size(self._cur_task)
         
         # 忘却クラスの更新
-        self.forget_classes += [cls for cls in self.forget_list[self._cur_task]]
+        # 今タスクで新たに忘却するクラス
+        self.cur_forget_classes = [cls for cls in self.forget_list[self._cur_task]]
+        # これまでの累積忘却クラス
+        self.forget_classes += self.cur_forget_classes
+
         logging.info(
-            "forget classes on task{}: {}".format(self._cur_task, self.forget_classes))
+            "forget classes on task{}: total={} (new={})".format(
+                self._cur_task, self.forget_classes, self.cur_forget_classes
+            )
+        )
 
         # model の fc層 の出力次元数を変更
         self._network.update_fc(self._total_classes*4)
@@ -118,20 +125,36 @@ class BASELINE_replay(BaseLearner):
         logging.info('Trainable params: {}'.format(
             count_parameters(self._network, True)))
 
+        # print("self._get_memory(): ", self._get_memory())
+
         # 現在タスクの訓練用データセットを作成
-        train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source='train',
-                                                 mode='train', appendent=self._get_memory())
+        # train_dataset = data_manager.get_dataset(np.arange(self._known_classes,
+        #                                                    self._total_classes),
+        #                                                    source='train',
+        #                                                    mode='train',
+        #                                                    appendent=self._get_memory())
+        train_dataset = data_manager.get_dataset(np.arange(self._known_classes,
+                                                           self._total_classes),
+                                                           source='train',
+                                                           mode='train',
+                                                           appendent=None)
         # 訓練用データローダーを作成
-        self.train_loader = DataLoader(
-            train_dataset, batch_size=self.args["batch_size"], shuffle=True, num_workers=self.args["num_workers"], pin_memory=True)
+        self.train_loader = DataLoader(train_dataset,
+                                       batch_size=self.args["batch_size"],
+                                       shuffle=True,
+                                       num_workers=self.args["num_workers"],
+                                       pin_memory=True)
         
         # テスト用データセットを作成
-        test_dataset = data_manager.get_dataset(
-            np.arange(0, self._total_classes), source='test', mode='test')
+        test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes),
+                                                source='test',
+                                                mode='test')
         
         # テスト用データローダーを作成
-        self.test_loader = DataLoader(
-            test_dataset, batch_size=self.args["batch_size"], shuffle=False, num_workers=self.args["num_workers"])
+        self.test_loader = DataLoader(test_dataset,
+                                      batch_size=self.args["batch_size"],
+                                      shuffle=False,
+                                      num_workers=self.args["num_workers"])
 
         # 複数gpuが使用可能ならDPを適用
         if len(self._multiple_gpus) > 1:
@@ -391,11 +414,13 @@ class BASELINE_replay(BaseLearner):
         loss_unl_mem = torch.tensor(0., device=self._device)
         lambda_unl = self.args["lambda_unl"]
 
-        if lambda_unl > 0 and len(self.forget_classes) > 0:
+        # 今タスクで新しく忘却するクラスだけに対して忘却損失をかける
+        current_forget = getattr(self, "cur_forget_classes", [])
+        if lambda_unl > 0 and len(current_forget) > 0:
             
             # ---------- (A) 既存: prototype ベース ----------
-            # 忘却クラスに属する prototypes のクラスIDだけを集める
-            forget_class_list = [c for c in self._protos.keys() if c in self.forget_classes]
+            # このタスクで新たに忘却するクラスに属する proto だけを対象にする
+            forget_class_list = [c for c in self._protos.keys() if c in current_forget]
 
             if len(forget_class_list) > 0:
                 forget_features = []
@@ -441,7 +466,10 @@ class BASELINE_replay(BaseLearner):
 
             if hasattr(self, "_data_memory") and len(self._data_memory) > 0:
                 
-                mem_inputs, mem_targets = self._sample_forget_memory_batch(20)
+                # 今タスクで新しく忘却するクラスからのみサンプルする
+                mem_inputs, mem_targets = self._sample_forget_memory_batch(
+                    20, target_classes=current_forget
+                )
                 # print("mem_targets: ", mem_targets)
 
                 if mem_inputs is not None:
@@ -638,24 +666,28 @@ class BASELINE_replay(BaseLearner):
         return cnn_accy, nme_accy
    
 
-    def _sample_forget_memory_batch(self, num_samples):
+    def _sample_forget_memory_batch(self, num_samples, target_classes=None):
         """
         self._data_memory / self._targets_memory から
-        self.forget_classes に属するサンプルだけをランダムに num_samples 個取り出して
-        1 バッチ分の (inputs, targets) を返す。
+        target_classes（指定がなければ self.forget_classes）に属するサンプルだけを
+        ランダムに num_samples 個取り出して 1 バッチ分の (inputs, targets) を返す。
 
-        メモリ or 忘却クラスが空のときは (None, None) を返す。
+        メモリ or 対象クラスが空のときは (None, None) を返す。
         """
         # メモリがまだ空なら何もしない
         if not hasattr(self, "_data_memory") or self._data_memory.size == 0:
             return None, None
 
-        # 忘却クラスが指定されていない場合
-        if len(self.forget_classes) == 0:
+        # 対象クラス集合の決定（指定がなければ累積 forget_classes）
+        if target_classes is None:
+            target_classes = self.forget_classes
+
+        # 対象クラスが指定されていない or 空なら何もしない
+        if target_classes is None or len(target_classes) == 0:
             return None, None
 
-        # numpy の targets から forget クラスに属する index を抜き出す
-        mask = np.isin(self._targets_memory, np.array(self.forget_classes))
+        # numpy の targets から target_classes に属する index を抜き出す
+        mask = np.isin(self._targets_memory, np.array(target_classes))
         idxs = np.where(mask)[0]
         if len(idxs) == 0:
             return None, None

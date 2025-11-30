@@ -13,7 +13,7 @@ __pycache__/
 *.txt
 *.pdf
 *.csv
-debug_*/
+debug*/
 run_linear2_private.sh
 run_linear3_private.sh
 reconstruction_images

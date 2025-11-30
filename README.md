@@ -60,6 +60,14 @@ SSOCL/
   python main.py --config=exps/PRL_MU/tiny.json
   ```
 
+
+### ImageNet100の実行
+[ImageNet](https://github.com/rmccorm4/Tiny-Imagenet-200?tab=readme-ov-file)をダウンロードして，`utils/data.py`で指定されるディレクトリに配置してください．
+- ImageNetでbaselineを学習
+  ```
+  python main.py --config=exps/BASELINE/imnet100.json
+  ```
+
 ### 分析・調査用
 リプレイバッファありの学習．
 忘却クラスのデータが使用可能と仮定し，どのような損失ならbackbone側の知識を削除できるかを確かめるために使用する．
