@@ -20,7 +20,8 @@ SSOCL/
 
 <details>
   <summary><b>CIFAR-100の実行</b></summary>
-学習を実行すればデータセットが自動的にダウンロードされます．
+
+  学習を実行すればデータセットが自動的にダウンロードされます．
   - CIFAR-100でbaselineを学習
     ```
     python main.py --config=exps/BASELINE/cifar.json
