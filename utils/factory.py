@@ -29,5 +29,8 @@ def get_model(model_name, args):
         return BASELINE_replay(args)
     elif name == "baseline-replay2":
         return BASELINE_replay2(args)
+    elif name == "baseline-replay3":
+        assert False
+        
     else:
         assert 0

@@ -19,6 +19,7 @@ SSOCL/
 学習・評価の実行方法は以下の通りです．
 
 ### CIFAR-100の実行
+{{
 学習を実行すればデータセットが自動的にダウンロードされます．
 - CIFAR-100でbaselineを学習
   ```
@@ -40,6 +41,7 @@ SSOCL/
   ```
   python main.py --config=exps/PRL_MU/cifar.json
   ```
+}}
 
 ### Tiny-ImageNetの実行
 [tiny-imagenet-200](https://github.com/rmccorm4/Tiny-Imagenet-200?tab=readme-ov-file)をダウンロードして，`utils/data.py`で指定されるディレクトリに配置してください．
