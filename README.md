@@ -75,7 +75,14 @@ SSOCL/
   ```
   python main.py --config=exps/BASELINE_replay/cifar.json
   ```
-
+- CIFAR-100でbaseline-replay2を学習
+  ```
+  python main.py --config=exps/BASELINE_replay2/cifar.json
+  ```
+- ImageNet100でbaseline-replay2を学習
+  ```
+  python main.py --config=exps/BASELINE_replay2/imnet100.json
+  ```
 
 ### ImageNet100
 現在実装中です．

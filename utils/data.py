@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
@@ -124,6 +125,8 @@ class iImageNet100(iData):
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
+
+        logging.info("train_dset.class_to_idx: {}".format(train_dset.class_to_idx))
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
