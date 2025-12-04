@@ -43,6 +43,9 @@ SSOCL/
     python main.py --config=exps/PRL_MU/cifar.json
     ```
 
+ </details>
+
+
 <details>
   <summary><b>Tiny-ImageNetの実行</b></summary>
 
@@ -64,6 +67,8 @@ SSOCL/
     python main.py --config=exps/PRL_MU/tiny.json
     ```
 
+</details>
+
 <details>
   <summary><b>ImageNet100の実行</b></summary>
 
@@ -73,27 +78,28 @@ SSOCL/
     python main.py --config=exps/BASELINE/imnet100.json
     ```
 
-### 分析・調査用
-リプレイバッファありの学習．
-忘却クラスのデータが使用可能と仮定し，どのような損失ならbackbone側の知識を削除できるかを確かめるために使用する．
-- CIFAR-100でbaseline-replayを学習
-  ```
-  python main.py --config=exps/BASELINE_replay/cifar.json
-  ```
-- CIFAR-100でbaseline-replay2を学習
-  ```
-  python main.py --config=exps/BASELINE_replay2/cifar.json
-  ```
-- ImageNet100でbaseline-replay2を学習
-  ```
-  python main.py --config=exps/BASELINE_replay2/imnet100.json
-  ```
+</details>
 
-### ImageNet100
-現在実装中です．
-PRLと同じクラスが不明です．
-<!-- Please note to change the paths of the different datasets in `utils/data` to the paths of your dataset files -->
+<details>
+  <summary><b>分析・調査用</b></summary>
 
-## Dataset
-We provide a version of the ImageNet-Subset dataset (randomly seeded 1993) that has been segmented for academic research use only. Click [here](https://mega.nz/file/9ikj1bbB#Zax1V7Q1xPlkxu8C9bOq8Ocq6WAu_-jtyqvta2hkTN0) to get it. Please contact me immediately if infringement or violation is involved.
+  リプレイバッファありの学習．
+  忘却クラスのデータが使用可能と仮定し，どのような損失ならbackbone側の知識を削除できるかを確かめるために使用する．
+  - CIFAR-100でbaseline-replayを学習
+    ```
+    python main.py --config=exps/BASELINE_replay/cifar.json
+    ```
+  - CIFAR-100でbaseline-replay2を学習
+    ```
+    python main.py --config=exps/BASELINE_replay2/cifar.json
+    ```
+  - ImageNet100でbaseline-replay2を学習
+    ```
+    python main.py --config=exps/BASELINE_replay2/imnet100.json
+    ```
+
+</details>
+
+<!-- ## Dataset
+We provide a version of the ImageNet-Subset dataset (randomly seeded 1993) that has been segmented for academic research use only. Click [here](https://mega.nz/file/9ikj1bbB#Zax1V7Q1xPlkxu8C9bOq8Ocq6WAu_-jtyqvta2hkTN0) to get it. Please contact me immediately if infringement or violation is involved. -->
 
