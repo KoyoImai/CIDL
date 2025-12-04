@@ -21,26 +21,26 @@ SSOCL/
 <details>
   <summary><b>CIFAR-100の実行</b></summary>
 学習を実行すればデータセットが自動的にダウンロードされます．
-- CIFAR-100でbaselineを学習
-  ```
-  python main.py --config=exps/BASELINE/cifar.json
-  ```
-- CIFAR-100でMachine Unlearning用のbaselineを学習
-  ```
-  python main.py --config=exps/BASELINE_MU/cifar.json
-  ```
-- CIFAR-100で通常のPRLを学習
-  ```
-  python main.py --config=exps/PRL/cifar.json
-  ```
-- CIFAR-100で通常のPRL2を学習
-  ```
-  python main.py --config=exps/PRL2/cifar.json
-  ```
-- CIFAR-100でMachine Unlearning用に調整したPRLを学習
-  ```
-  python main.py --config=exps/PRL_MU/cifar.json
-  ```
+  - CIFAR-100でbaselineを学習
+    ```
+    python main.py --config=exps/BASELINE/cifar.json
+    ```
+  - CIFAR-100でMachine Unlearning用のbaselineを学習
+    ```
+    python main.py --config=exps/BASELINE_MU/cifar.json
+    ```
+  - CIFAR-100で通常のPRLを学習
+    ```
+    python main.py --config=exps/PRL/cifar.json
+    ```
+  - CIFAR-100で通常のPRL2を学習
+    ```
+    python main.py --config=exps/PRL2/cifar.json
+    ```
+  - CIFAR-100でMachine Unlearning用に調整したPRLを学習
+    ```
+    python main.py --config=exps/PRL_MU/cifar.json
+    ```
 
 
 ### Tiny-ImageNetの実行
