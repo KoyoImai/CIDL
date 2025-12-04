@@ -62,6 +62,15 @@ class BASELINE_replay3(BaseLearner):
         # 損失関数
         self.pes_loss_func = PES_Loss()
         self.old_ae = None
+
+        # ===== ランダム教師モデルの追加 =====
+        # 同じ構造のネットワークをランダム初期化したまま固定しておく
+        self._teacher = IncrementalNet(args, False)
+        self._teacher.to(self._device)
+        self._teacher.eval()
+        for p in self._teacher.parameters():
+            p.requires_grad = False
+        # ===============================
     
 
     def after_task(self):
@@ -366,7 +375,6 @@ class BASELINE_replay3(BaseLearner):
 
 
         # ---------- incremental task ----------
-
         # まず Feature KD（保持クラス全体に対して）
         with torch.no_grad():
             features_old = self.old_network_module_ptr.extract_vector(inputs)
@@ -428,7 +436,6 @@ class BASELINE_replay3(BaseLearner):
         retain_mask = ~forget_mask
 
         # ---------- CE: 忘却対象でないサンプルのみ ----------
-
         if retain_mask.any():
             logits_retain = logits[retain_mask]
             targets_retain = aug_targets[retain_mask]
@@ -441,25 +448,28 @@ class BASELINE_replay3(BaseLearner):
         loss_new = loss_clf
 
 
-        # ---------- Unlearning: 忘却対象サンプルを一様分布に近づける ----------
-
+        # ---------- Unlearning: 忘却対象サンプルの特徴量をランダム教師の出力に近づける ----------
         loss_unl_inputs = torch.tensor(0., device=self._device)
         if lambda_unl > 0 and forget_mask.any():
-            logits_forget = logits[forget_mask]
-            log_p = torch.nn.functional.log_softmax(
-                logits_forget / self.args["temp"], dim=1
-            )
-            num_classes = log_p.size(1)
-            uniform = torch.full_like(log_p, 1.0 / num_classes)
-            loss_unl_inputs = lambda_unl * torch.nn.functional.kl_div(
-                log_p, uniform, reduction="batchmean"
+
+            # 教師特徴を取得
+            with torch.no_grad():
+                teacher_features = self._teacher.extract_vector(inputs)   # [4B, D]
+
+            # 忘却対象サンプルだけ抽出
+            student_forget = features[forget_mask]            # [N_forget, D]
+            teacher_forget = teacher_features[forget_mask]    # [N_forget, D]
+
+            # MSE による特徴蒸留（ランダム教師 → 生徒）
+            #   loss_unl_inputs = λ_unl * || f_s - f_t ||^2
+            loss_unl_inputs = lambda_unl * F.mse_loss(
+                student_forget, teacher_forget, reduction="mean"
             )
 
-        # ここでは prototype ベースの unlearning を loss_unl にまとめてしまう設計でもいいですが、
-        # わかりやすさのために「入力サンプルからの unlearning 分」だけを loss_unl として返します。
+        # loss_unl: 入力サンプルベースの unlearning 損失
         loss_unl = loss_unl_inputs
 
-        # 旧実装の loss_unl_mem（リプレイから忘却クラスだけを抽出して使う項）は「もう使わない」ので 0
+        # loss_unl_mem は使わないので 0
         loss_unl_mem = torch.tensor(0., device=self._device)
 
         return logits, loss_new, loss_fkd, loss_proto, loss_unl, loss_unl_mem

@@ -6,6 +6,8 @@ from models.BASELINE import BASELINE
 from models.BASELINE_MU import BASELINE_MU
 from models.BASELINE_replay import BASELINE_replay
 from models.BASELINE_replay2 import BASELINE_replay2
+from models.BASELINE_replay3 import BASELINE_replay3
+
 
 def get_model(model_name, args):
 
@@ -30,7 +32,7 @@ def get_model(model_name, args):
     elif name == "baseline-replay2":
         return BASELINE_replay2(args)
     elif name == "baseline-replay3":
-        assert False
-        
+        return BASELINE_replay3(args)
+
     else:
         assert 0
