@@ -43,33 +43,35 @@ SSOCL/
     python main.py --config=exps/PRL_MU/cifar.json
     ```
 
+<details>
+  <summary><b>Tiny-ImageNetの実行</b></summary>
 
-### Tiny-ImageNetの実行
-[tiny-imagenet-200](https://github.com/rmccorm4/Tiny-Imagenet-200?tab=readme-ov-file)をダウンロードして，`utils/data.py`で指定されるディレクトリに配置してください．
-- Tiny-ImageNetでbaselineを学習
-  ```
-  python main.py --config=exps/BASELINE/tiny.json
-  ```
-- Tiny-ImageNetでMachine Unlearning用のbaselineを学習
-  ```
-  python main.py --config=exps/BASELINE_MU/tiny.json
-  ```
-- Tiny-ImageNetで通常のPRL2を学習
-  ```
-  python main.py --config=exps/PRL2/tiny.json
-  ```
-- Tiny-ImageNetでMachine Unlearning用に調整したPRLを学習
-  ```
-  python main.py --config=exps/PRL_MU/tiny.json
-  ```
+  [tiny-imagenet-200](https://github.com/rmccorm4/Tiny-Imagenet-200?tab=readme-ov-file)をダウンロードして，`utils/data.py`で指定されるディレクトリに配置してください．
+  - Tiny-ImageNetでbaselineを学習
+    ```
+    python main.py --config=exps/BASELINE/tiny.json
+    ```
+  - Tiny-ImageNetでMachine Unlearning用のbaselineを学習
+    ```
+    python main.py --config=exps/BASELINE_MU/tiny.json
+    ```
+  - Tiny-ImageNetで通常のPRL2を学習
+    ```
+    python main.py --config=exps/PRL2/tiny.json
+    ```
+  - Tiny-ImageNetでMachine Unlearning用に調整したPRLを学習
+    ```
+    python main.py --config=exps/PRL_MU/tiny.json
+    ```
 
+<details>
+  <summary><b>ImageNet100の実行</b></summary>
 
-### ImageNet100の実行
-[ImageNet](https://github.com/rmccorm4/Tiny-Imagenet-200?tab=readme-ov-file)をダウンロードして，`utils/data.py`で指定されるディレクトリに配置してください．
-- ImageNetでbaselineを学習
-  ```
-  python main.py --config=exps/BASELINE/imnet100.json
-  ```
+  [ImageNet](https://github.com/rmccorm4/Tiny-Imagenet-200?tab=readme-ov-file)をダウンロードして，`utils/data.py`で指定されるディレクトリに配置してください．
+  - ImageNetでbaselineを学習
+    ```
+    python main.py --config=exps/BASELINE/imnet100.json
+    ```
 
 ### 分析・調査用
 リプレイバッファありの学習．
