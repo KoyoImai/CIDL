@@ -43,7 +43,7 @@ models/
 
 
 <details>
-  <summary><b>BASELINE_MU</b></summary>
+    <summary><b>BASELINE_MU</b></summary>
 
     BASELINEアプローチにMachine Unlearning (MU) 的な損失関数を追加したアプローチです．
     損失関数として，以下を採用しています．
