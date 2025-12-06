@@ -97,6 +97,10 @@ SSOCL/
     ```
     python main.py --config=exps/BASELINE_replay2/imnet100.json
     ```
+  - ImageNet100でbaseline-replay3を学習
+    ```
+    python main.py --config=exps/BASELINE_replay3/imnet100.json
+    ```
 
 </details>
 
