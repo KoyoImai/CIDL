@@ -60,6 +60,8 @@ class DataManager(object):
             )
         elif mode == "test":
             trsf = transforms.Compose([*self._test_trsf, *self._common_trsf])
+        elif mode == "plot":
+            trsf = transforms.Compose([*self._test_trsf, *self._common_trsf])
         else:
             raise ValueError("Unknown mode {}.".format(mode))
 
