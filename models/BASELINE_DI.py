@@ -1,12 +1,18 @@
+import os
+import random
 import logging
 import copy
+from PIL import Image
 import numpy as np
 from tqdm import tqdm
+
 import torch
 from torch import nn
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader,Dataset
+import torchvision.utils as vutils
+
 from models.base import BaseLearner
 from utils.inc_net import IncrementalNet, AKAIncrementalNet
 from utils.toolkit import count_parameters, target2onehot, tensor2numpy
@@ -17,6 +23,87 @@ from utils.autoaugment import CIFAR10Policy
 import time
 
 EPSILON = 1e-8
+
+# ========================= DeepInversion helpers =========================
+# [DI-NEW]
+class DeepInversionFeatureHook:
+    """
+    BatchNorm2d の running_mean / running_var と
+    実際の feature の mean / var のズレを L2 で測る hook。
+    DeepInversion の r_feature loss 用。
+    """
+    # [DI-NEW]
+    def __init__(self, module: nn.BatchNorm2d):
+        self.r_feature = None
+        self.hook = module.register_forward_hook(self._hook_fn)
+
+    # [DI-NEW]
+    def _hook_fn(self, module, input, output):
+        x = input[0]  # (N, C, H, W)
+        n, c = x.shape[:2]
+
+        mean = x.mean(dim=[0, 2, 3])
+        var = x.permute(1, 0, 2, 3).contiguous().view(c, -1).var(dim=1, unbiased=False)
+
+        mean_bn = module.running_mean
+        var_bn = module.running_var
+
+        # L2 norm の和
+        self.r_feature = torch.norm(mean - mean_bn, 2) + torch.norm(var - var_bn, 2)
+
+    # [DI-NEW]
+    def close(self):
+        self.hook.remove()
+
+# [DI-NEW]
+def get_image_prior_losses(inputs_jit):
+    # COMPUTE total variation regularization loss
+    diff1 = inputs_jit[:, :, :, :-1] - inputs_jit[:, :, :, 1:]
+    diff2 = inputs_jit[:, :, :-1, :] - inputs_jit[:, :, 1:, :]
+    diff3 = inputs_jit[:, :, 1:, :-1] - inputs_jit[:, :, :-1, 1:]
+    diff4 = inputs_jit[:, :, :-1, :-1] - inputs_jit[:, :, 1:, 1:]
+
+    loss_var_l2 = torch.norm(diff1) + torch.norm(diff2) + torch.norm(diff3) + torch.norm(diff4)
+    loss_var_l1 = (diff1.abs() / 255.0).mean() + (diff2.abs() / 255.0).mean() + (
+            diff3.abs() / 255.0).mean() + (diff4.abs() / 255.0).mean()
+    loss_var_l1 = loss_var_l1 * 255.0
+    return loss_var_l1, loss_var_l2
+
+def lr_policy(lr_fn):
+    def _alr(optimizer, iteration, epoch):
+        lr = lr_fn(iteration, epoch)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+    return _alr
+
+def lr_cosine_policy(base_lr, warmup_length, epochs):
+    def _lr_fn(iteration, epoch):
+        if epoch < warmup_length:
+            lr = base_lr * (epoch + 1) / warmup_length
+        else:
+            e = epoch - warmup_length
+            es = epochs - warmup_length
+            lr = 0.5 * (1 + np.cos(np.pi * e / es)) * base_lr
+        return lr
+
+    return lr_policy(_lr_fn)
+
+def clip(image_tensor, use_fp16=False):
+    '''
+    adjust the input based on mean and variance
+    '''
+    if use_fp16:
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float16)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float16)
+    else:
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+    for c in range(3):
+        m, s = mean[c], std[c]
+        image_tensor[:, c] = torch.clamp(image_tensor[:, c], -m / s, (1 - m) / s)
+    return image_tensor
+
 
 
 class BASELINE_DI(BaseLearner):
@@ -71,7 +158,18 @@ class BASELINE_DI(BaseLearner):
         for p in self._teacher.parameters():
             p.requires_grad = False
         # ===============================
-    
+
+        # ===== DeepInversion用の初期化を追加 =====
+        self.di_batch_size   = 400     
+        self.di_iterations   = 100         # 最適化ステップ数
+        self.di_lr           = 0.25
+        self.di_r_feature    = 0.01         # BN loss の係数
+        self.di_tv_l2        = 0.0001       # TV loss の係数
+        self.di_tv_l1        = 0.0
+        self.di_l2           = 0.00001      # 画像 L2 loss の係数
+        self.main_loss_multiplier = 1.0
+
+
 
     def after_task(self):
 
@@ -97,15 +195,22 @@ class BASELINE_DI(BaseLearner):
             logging.info(f"Update replay memory: m={m} per class")
             self.build_rehearsal_memory(self.data_manager, m)
 
-        # チェックポイントの保存
-        self.save_checkpoint("checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
+        ckpt_dir = "checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
             self.args["model_name"],
             self.args["log_name"],
             self.args["dataset"],
             self.args["init_cls"],
             self.args["increment"],
-            self.args["lambda_fkd"], self.args["lambda_proto"], self.args["lambda_pes"], self.args["lambda_pgru"], self.args["lambda_unl"],)
-        )
+            self.args["lambda_fkd"], self.args["lambda_proto"], self.args["lambda_pes"], self.args["lambda_pgru"], self.args["lambda_unl"])
+
+        # チェックポイントの保存
+        self.save_checkpoint(ckpt_dir)
+
+        # DI で生成した画像の保存
+        if isinstance(self._data_memory, np.ndarray) and self._data_memory.size > 0:
+            self._save_di_images(ckpt_dir)
+
+
     def incremental_train(self, data_manager):
         
         # data_managerの登録
@@ -194,10 +299,20 @@ class BASELINE_DI(BaseLearner):
         
         # デバッグ用かな？
         resume = False
-        if self._cur_task in []:
-            self._network.load_state_dict(torch.load("checkpoint/{}/{}/{}/{}/phase{}.pkl".format(self.args["model_name"],self.args["dataset"],self.args["init_cls"],self.args["increment"],self._cur_task))["model_state_dict"])
+        if self._cur_task in [0]:
+            path = "checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/phase{}.pkl".format(
+                self.args["model_name"],
+                self.args["log_name"],
+                self.args["dataset"],
+                self.args["init_cls"],
+                self.args["increment"],
+                self.args["lambda_fkd"], self.args["lambda_proto"], self.args["lambda_pes"], self.args["lambda_pgru"], self.args["lambda_unl"],
+                self._cur_task)
+            self._network.load_state_dict(torch.load(path)["model_state_dict"])
             resume = True
             logging.info('!!!resume!!!')
+            # assert False
+        # assert False
         
         # model を device に配置
         self._network.to(self._device)
@@ -235,7 +350,6 @@ class BASELINE_DI(BaseLearner):
                 class_mean = np.mean(vectors, axis=0)
                 prototype[class_idx] = class_mean
             self._protos.update(prototype)
-
 
 
     def _train_function(self, train_loader, test_loader, optimizer, scheduler):
@@ -530,6 +644,7 @@ class BASELINE_DI(BaseLearner):
 
         return np.around(tensor2numpy(correct)*100 / total, decimals=2)
 
+
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
@@ -731,6 +846,7 @@ class BASELINE_DI(BaseLearner):
             source="train",
             mode="test",                  # ここは test / train どちらでもよいが，とりあえず test で固定
             appendent=(forget_data, forget_targets),
+            setup_replay=False,
         )
         forget_loader = DataLoader(
             forget_dataset,
@@ -746,74 +862,339 @@ class BASELINE_DI(BaseLearner):
         targets = targets.to(self._device, non_blocking=True)
         return inputs, targets
 
+    # ============================================================
+    # 与えられたクラスラベル列に対して DeepInversion 画像を生成（ImageNet100）
+    # ============================================================  
+    def _generate_di_images_for_labels(self, class_labels: np.ndarray) -> np.ndarray:
+        """
+        class_labels: np.ndarray, shape (B,)
+            各要素が「元のクラスID」（0~num_classes-1）
 
+        戻り値:
+            imgs: np.ndarray, shape (B, H, W, 3), dtype=uint8
+        """
+
+        # パラメータの初期化
+        device = self._device
+        setting_id = 0
+        jitter = 30
+        B = int(class_labels.shape[0])
+        H = self.size
+        W = self.size
+
+        iters = self.di_iterations
+        lr = self.di_lr
+        T = 1.0
+        main_loss_multiplier = self.main_loss_multiplier
+        r_feature_coeff = self.di_r_feature
+        tv_l2_coeff = self.di_tv_l2
+        tv_l1_coeff = self.di_tv_l1
+        l2_coeff = self.di_l2
+
+        first_bn_multiplier = 10
+        do_flip = True
+
+        # teacher: after_task で更新した old_network を優先的に使う
+        teacher = getattr(self, "old_network_module_ptr", None)
+        if teacher is None:
+            teacher = self._network_module_ptr
+        teacher.eval()
+
+        ## Create hooks for feature statistics catching
+        loss_r_feature_layers = []
+        for module in teacher.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                loss_r_feature_layers.append(DeepInversionFeatureHook(module))
+
+        # 最適化入力の初期化
+        inputs = torch.randn((B, 3, self.size, self.size), requires_grad=True, device='cuda')
+        pooling_function = nn.modules.pooling.AvgPool2d(kernel_size=2)
+        targets = torch.from_numpy(class_labels).to(device=device, dtype=torch.long)
+        criterion = nn.CrossEntropyLoss()
+
+
+        if setting_id==0:
+            skipfirst = False
+        else:
+            skipfirst = True
+        
+
+        iteration = 0
+        best_cost = float("inf")
+        best_inputs = None
+        for lr_it, lower_res in enumerate([2, 1]):
+            if lr_it==0:
+                iterations_per_layer = 2000
+                # iterations_per_layer = 100
+            else:
+                iterations_per_layer = 1000 if not skipfirst else 2000
+                # iterations_per_layer = 100 if not skipfirst else 100
+                if setting_id == 2:
+                    iterations_per_layer = 20000
+            
+            if lr_it==0 and skipfirst:
+                continue
+
+            lim_0, lim_1 = jitter // lower_res, jitter // lower_res
+
+            if setting_id == 0:
+                #multi resolution, 2k iterations with low resolution, 1k at normal, ResNet50v1.5 works the best, ResNet50 is ok
+                optimizer = optim.Adam([inputs], lr=self.di_lr, betas=[0.5, 0.9], eps = 1e-8)
+                do_clip = True
+            elif setting_id == 1:
+                #2k normal resolultion, for ResNet50v1.5; Resnet50 works as well
+                optimizer = optim.Adam([inputs], lr=self.di_lr, betas=[0.5, 0.9], eps = 1e-8)
+                do_clip = True
+            elif setting_id == 2:
+                #20k normal resolution the closes to the paper experiments for ResNet50
+                optimizer = optim.Adam([inputs], lr=self.di_lr, betas=[0.9, 0.999], eps = 1e-8)
+                do_clip = False
+            
+            lr_scheduler = lr_cosine_policy(self.di_lr, 100, iterations_per_layer)
+
+
+            for iteration_loc in range(iterations_per_layer):
+                iteration += 1
+                # learning rate scheduling
+                lr_scheduler(optimizer, iteration_loc, iteration_loc)
+
+
+                # perform downsampling if needed
+                if lower_res!=1:
+                    inputs_jit = pooling_function(inputs)
+                else:
+                    inputs_jit = inputs
+
+                # apply random jitter offsets
+                off1 = random.randint(-lim_0, lim_0)
+                off2 = random.randint(-lim_1, lim_1)
+                inputs_jit = torch.roll(inputs_jit, shifts=(off1, off2), dims=(2, 3))
+
+                # Flipping
+                flip = random.random() > 0.5
+                if flip and do_flip:
+                    inputs_jit = torch.flip(inputs_jit, dims=(3,))
+
+                # forward pass
+                optimizer.zero_grad()
+                teacher.zero_grad()
+
+                outputs = teacher(inputs_jit)
+                logits_all = outputs["logits"]
+                logits = logits_all[:, ::4]
+
+                # R_cross classification loss
+                loss = criterion(logits, targets)
+
+                # R_prior losses
+                loss_var_l1, loss_var_l2 = get_image_prior_losses(inputs_jit)
+
+                # R_feature loss
+                rescale = [first_bn_multiplier] + [1. for _ in range(len(loss_r_feature_layers)-1)]
+                loss_r_feature = sum([mod.r_feature * rescale[idx] for (idx, mod) in enumerate(loss_r_feature_layers)])
+
+                # l2 loss on images
+                loss_l2 = torch.norm(inputs_jit.view(B, -1), dim=1).mean()
+
+                # combining losses
+                loss_aux = tv_l2_coeff * loss_var_l2 + \
+                            tv_l1_coeff * loss_var_l1 + \
+                            r_feature_coeff * loss_r_feature + \
+                            l2_coeff * loss_l2
+                        
+                loss = main_loss_multiplier * loss + loss_aux
+
+                if iteration % 10 == 0:
+                    logging.info(f"------------iteration {iteration}----------")
+                    logging.info(f"total loss: {loss.item():.4f}")
+                    logging.info(f"loss_r_feature: {loss_r_feature.item():.4f}")
+                    logging.info(f"main criterion: {criterion(logits, targets).item():.4f}")
+                
+                loss.backward()
+                optimizer.step()
+
+                if do_clip:
+                    inputs.data = clip(inputs.data, use_fp16=False)
+
+
+                if best_cost > loss.item() or iteration == 1:
+                    best_inputs = inputs.data.clone()
+                    best_cost = loss.item()
+
+                # if iteration % 100==0:
+                #     vutils.save_image(inputs,
+                #                         '{}/best_images/output_{:05d}_gpu.png'.format(prefix, iteration // 100,),
+                #                         normalize=True, scale_each=True, nrow=int(10))
+
+        for h in loss_r_feature_layers:
+            h.close()      # module.register_forward_hook を解除
+        
+        with torch.no_grad():
+            out = best_inputs.clone()
+
+            # ImageNet 正規化を戻す
+            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+            std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+            out = out * std + mean
+            out = torch.clamp(out, 0.0, 1.0)
+            out = (out * 255.0).byte()
+            out = out.permute(0, 2, 3, 1).cpu().numpy()  # (B, H, W, 3)
+        
+        return out
+
+    # リプレイバッファの構築
     def build_rehearsal_memory(self, data_manager, per_class):
         """
-        リプレイバッファを「将来忘却されるクラスのみ」「各クラス固定 n サンプル」で構築する。
-        
-        ただし：
-          - すでに一度でも forget 対象になったクラス
-              → self.forget_classes に入っているクラス
-            は二度と replay に入れない（追加要件）。
-
-        したがって，replay に入るのは
-            all_forget_classes ∩ [0, total_classes)
-          から，forget_classes を引いたクラスだけ。
+        DeepInversion で生成した画像をリプレイバッファに保存する版。
+        クラスの選び方（将来 forget クラスのみ & まだ forget 済みでない）は
+        BASELINE_replay6 と同じ。
         """
-
         # per_class 引数は無視し，固定 n を使う
         n = getattr(self, "forget_memory_per_class", per_class)
         if n <= 0:
-            self._data_memory = np.array([])
-            self._targets_memory = np.array([])
             logging.info("[Replay2] Skip building replay memory (n <= 0).")
+            return
+        
+        # すでに「忘却対象になった」クラス集合
+        already_forgotten = set(getattr(self, "forget_classes", []))
+
+        # これから先のタスクで忘却される予定 & まだ忘却されていない & すでに出現済み
+        candidate_classes = [
+            c for c in self.all_forget_classes
+            if (c not in already_forgotten) and (c < self._total_classes)
+        ]
+
+        # すでにリプレイバッファに入っているクラス
+        if hasattr(self, "_targets_memory") and self._targets_memory is not None and len(self._targets_memory) > 0:
+            existing_classes = set(self._targets_memory.tolist())
+        else:
+            existing_classes = set()
+
+        # 「バッファにまだ一度も入っていない」クラスだけを今回の追加対象にする
+        target_classes = [c for c in candidate_classes if c not in existing_classes]
+
+        logging.info(
+            f"[DI] Building replay memory with DeepInversion: "
+            f"n={n} per class for target_classes={target_classes}, "
+            f"already_forgotten={sorted(already_forgotten)}"
+        )
+
+        if len(target_classes) == 0:
+            logging.info(
+                f"[DI] No NEW target classes for replay memory. "
+                f"Keep existing buffer as-is. candidate={candidate_classes}, existing={sorted(existing_classes)}"
+            )
             return
 
         all_exemplars = []
         all_labels = []
 
-        # すでに「忘却対象になった」クラス集合
-        already_forgotten = set(getattr(self, "forget_classes", []))
+        # ================== ここから DI 画像一括生成部分 ==================  #
+        # DeepInversionによってに画像を生成
+        # クラスごとに分けて生成せず，必要な画像数を一括で生成
+        # （gpuなどの問題で一括生成が難しい場合は複数回に分けて生成する）
 
-        # これから先のタスクで忘却される予定 & まだ忘却されていない & すでに出現済み
-        target_classes = [
-            c for c in self.all_forget_classes
-            if (c not in already_forgotten) and (c < self._total_classes)
-        ]
+        
+        # 例: target_classes = [0,1,5], n = 3 のとき
+        # labels_all = [0,0,0, 1,1,1, 5,5,5]
+        labels_all = np.repeat(np.array(target_classes, dtype=np.int64), n)
+        total = labels_all.shape[0]
 
-        for class_idx in target_classes:
-            # このクラスの train data を全部取ってくる
-            data, targets, _ = data_manager.get_dataset(
-                np.arange(class_idx, class_idx + 1),
-                source="train",
-                mode="test",
-                ret_data=True,
-            )
-            if len(data) == 0:
-                continue
+        # labels_allを並び替え
+        perm = np.random.permutation(total)
+        labels_all = labels_all[perm]
 
-            # 各クラス固定 n サンプル
-            num = min(n, len(data))
-            inds = np.random.choice(len(data), size=num, replace=False)
+        # 1 回の DeepInversion 最適化で扱う枚数
+        # （__init__ で self.di_batch_size を args から読んでおく想定）
+        max_batch = getattr(self, "di_batch_size", 64)
 
-            all_exemplars.append(data[inds])
-            all_labels.append(targets[inds])
+        start = 0
+        while start < total:
+            end = min(start + max_batch, total)
+            batch_labels = labels_all[start:end]            # np.ndarray (B,)
 
-        if len(all_exemplars) > 0:
-            self._data_memory = np.concatenate(all_exemplars)
-            self._targets_memory = np.concatenate(all_labels)
+            # DeepInversion によって batch_labels に対応する画像を生成
+            # elif "imagenet" in self.args["dataset"]:
+            if self.args["dataset"] in ["imagenet100"]:
+                di_imgs = self._generate_di_images_for_labels(batch_labels)
+            elif self.args["dataset"] in ["cifar100"]:
+                assert False
+            # di_imgs: (B, H, W, 3) の uint8 を想定
+
+            all_exemplars.append(di_imgs)
+            all_labels.append(batch_labels)
+
+            start = end
+
+        if len(all_exemplars) == 0:
+            logging.info("[DI] No DI images were generated for new target classes.")
+            return
+
+        new_data = np.concatenate(all_exemplars, axis=0)
+        new_labels = np.concatenate(all_labels, axis=0)
+
+        # 既存のメモリがある場合は後ろに append、無ければ新規作成
+        if hasattr(self, "_data_memory") and self._data_memory is not None and len(self._data_memory) > 0:
+            self._data_memory = np.concatenate([self._data_memory, new_data], axis=0)
+            self._targets_memory = np.concatenate([self._targets_memory, new_labels], axis=0)
         else:
-            self._data_memory = np.array([])
-            self._targets_memory = np.array([])
+            self._data_memory = new_data
+            self._targets_memory = new_labels
 
         logging.info(
-            f"[Replay2] Stored {len(self._targets_memory)} exemplars "
-            f"({n} per class for {len(target_classes)} future-forget classes, "
-            f"skip already-forgotten={sorted(already_forgotten)})."
+            f"[DI] Added {len(new_labels)} DI exemplars "
+            f"for new target classes {target_classes}. "
+            f"Total buffer size = {len(self._targets_memory)}"
         )
 
+    # ============================================================
+    # DeepInversion で生成したリプレイ画像を保存 (.png + .pth)
+    # ============================================================
+    def _save_di_images(self, checkpoint_dir: str):
+        """
+        checkpoint_dir:
+            BaseLearner.save_checkpoint と同じディレクトリパス。
+            その直下に di_task{cur_task}/ を作り、
+            - cls{c}_idx{n}.png
+            - di_task{cur_task}.pth
+            を保存する。
+        """
+        if getattr(self, "_data_memory", None) is None:
+            return
+        if isinstance(self._data_memory, np.ndarray) and self._data_memory.size == 0:
+            return
 
+        images = self._data_memory          # (N, H, W, 3), uint8 を想定
+        labels = self._targets_memory       # (N,)
 
+        save_dir = os.path.join(checkpoint_dir, f"di_task{self._cur_task}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        N = images.shape[0]
+
+        # ---------- まず PNG として 1 枚ずつ保存 ----------
+        for i in range(N):
+            img_arr = images[i]
+            cls = int(labels[i])
+
+            img = Image.fromarray(img_arr.astype(np.uint8))
+            filename = f"cls{cls}_idx{i:05d}.png"
+            path = os.path.join(save_dir, filename)
+            img.save(path)
+
+        # ---------- まとめて .pth にも保存 ----------
+        # (N, H, W, 3) uint8 → (N, 3, H, W) uint8 の Tensor にして保存
+        imgs_tensor = torch.from_numpy(images).permute(0, 3, 1, 2).contiguous()  # uint8
+        labels_tensor = torch.from_numpy(labels.astype(np.int64))
+
+        save_obj = {
+            "images": imgs_tensor,   # shape: (N, 3, H, W), dtype: uint8
+            "labels": labels_tensor, # shape: (N,)
+            "task": int(self._cur_task),
+        }
+
+        pth_path = os.path.join(save_dir, f"di_task{self._cur_task}.pth")
+        torch.save(save_obj, pth_path)
 
 
 

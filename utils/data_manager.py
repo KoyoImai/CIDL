@@ -39,8 +39,11 @@ class DataManager(object):
         return len(self._class_order)
 
     def get_dataset(
-        self, indices, source, mode, appendent=None, ret_data=False, m_rate=None
+        self, indices, source, mode, appendent=None, ret_data=False, m_rate=None, setup_replay=None,
     ):
+        """
+            setup_replay: リプレイバッファからのデータ生成時限定の self.use_path 
+        """
         if source == "train":
             x, y = self._train_data, self._train_targets
         elif source == "test":
@@ -88,8 +91,11 @@ class DataManager(object):
         if ret_data:
             return data, targets, DummyDataset(data, targets, trsf, self.use_path)
         else:
-            return DummyDataset(data, targets, trsf, self.use_path)
-
+            if setup_replay is None:
+                return DummyDataset(data, targets, trsf, self.use_path)    # 
+            else:
+                return DummyDataset(data, targets, trsf, setup_replay)            # DI で作成したデータでデータセットを作成する場合，パスは絶対に使えないのでこっちを使用
+            
     def get_dataset_with_split(
         self, indices, source, mode, appendent=None, val_samples_per_class=0
     ):

@@ -782,7 +782,7 @@ class BASELINE_replay6(BaseLearner):
         ]
 
         for class_idx in target_classes:
-            # このクラスの train data を全部取ってくる
+            # このクラスの train data を全部取ってくる（未正規化）
             data, targets, _ = data_manager.get_dataset(
                 np.arange(class_idx, class_idx + 1),
                 source="train",
