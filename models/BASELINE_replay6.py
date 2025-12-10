@@ -735,7 +735,7 @@ class BASELINE_replay6(BaseLearner):
         forget_loader = DataLoader(
             forget_dataset,
             batch_size=num,
-            shuffle=False,
+            shuffle=True,
             num_workers=self.args["num_workers"],
             pin_memory=True,
         )

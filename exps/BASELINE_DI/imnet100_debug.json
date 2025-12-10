@@ -1,6 +1,6 @@
 {
     "prefix": "train",
-    "log_name": "baseline",
+    "log_name": "debug2",
     "dataset": "imagenet100",
     "memory_size": 1000,
     "shuffle": true,
@@ -19,7 +19,7 @@
                    [13, 90]],
     "model_name": "baseline-di",
     "convnet_type": "resnet18_cbam",
-    "device": ["0"],
+    "device": ["2"],
     "seed": [1993],
     "lambda_fkd": 10,
     "lambda_proto": 10,
