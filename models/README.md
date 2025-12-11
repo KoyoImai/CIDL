@@ -165,6 +165,30 @@ models/
 
  </details>
 
+ <details>
+  <summary><b>BASELINE_DIMMD</b></summary>
+
+    BASELINEアプローチにMachine Unlearning (MU) 的な損失関数を追加し，DeepInversion (DI) によるリプレイを追加したアプローチです．
+    BASELINE_DIとは異なり，DeepInversionに追加のアプローチ（MMD損失，feat_div損失，proto損失）を導入しています．
+    リプレイバッファに過去のデータを保存し，忘却損失にのみ過去データを使用します．
+    リプレイバッファのデータは，データローダーに混ぜず毎イタレーションリプレイバッファから直接取り出す．
+
+    ```
+    loss_new      : 新しいタスクのデータに対する通常の交差エントロピー損失
+    loss_fkd      : 新しいタスクのデータの特徴量に対するL2ノルムの蒸留損失
+    loss_proto    : 過去タスクのクラスに対応し，維持クラスに該当するプロトタイプでを使用した交差エントロピー損失（忘却クラスのプロトタイプは不使用）
+    loss_unl      : 忘却クラスのリプレイデータに対するコサイン類似度最大化損失
+    ```
+    それぞれの損失に対する重みは，`CIDL/exps/BASELINE_MU/xxx.json`に記述する`lambda_xxx`から指定できます．
+    対応する重みを以下に示します．
+    ```
+    lambda_fkd   : loss_fkd（L2ノルムの蒸留損失）に対する重み（デフォルトは10）
+    lambda_proto : loss_proto（プロトタイプを使用した交差エントロピー損失）に対する重み（デフォルトは10）
+    lambda_unl   : loss_unl（忘却クラスのエントロピー最大化損失）に対する重み
+    ```
+
+ </details>
+
 
 <details>
   <summary><b>PRL</b></summary>

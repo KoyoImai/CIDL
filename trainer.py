@@ -27,7 +27,7 @@ def _train(args):
     # ===============================
     # log name の決定
     # ===============================
-    init_cls = 0 if args ["init_cls"] == args["increment"] else args["init_cls"]
+    init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
     logs_name = "logs/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
         args["model_name"],
         args["log_name"],
