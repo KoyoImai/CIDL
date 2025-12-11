@@ -34,7 +34,6 @@ import time
 EPSILON = 1e-8
 
 # ========================= DeepInversion helpers =========================
-# [DI-NEW]
 class DeepInversionFeatureHook:
     """
     BatchNorm2d の running_mean / running_var と
@@ -64,7 +63,6 @@ class DeepInversionFeatureHook:
     def close(self):
         self.hook.remove()
 
-# [DI-NEW]
 def get_image_prior_losses(inputs_jit):
     # COMPUTE total variation regularization loss
     diff1 = inputs_jit[:, :, :, :-1] - inputs_jit[:, :, :, 1:]
@@ -113,6 +111,164 @@ def clip(image_tensor, use_fp16=False):
         image_tensor[:, c] = torch.clamp(image_tensor[:, c], -m / s, (1 - m) / s)
     return image_tensor
 
+
+# ============================================
+# RBF カーネル & MMD 損失の定義
+# ============================================
+import torch
+import torch.nn as nn
+
+
+class RBF(nn.Module):
+    """
+    RBF (Gaussian) カーネル行列を計算するクラス。
+    
+    k(x_i, x_j) = exp(- ||x_i - x_j||^2 / bandwidth)
+    
+    - bandwidth を指定しない場合は，
+      バッチ内の平均距離^2 から簡易的に推定します。
+    """
+
+    def __init__(self, bandwidth: float = None):
+        """
+        Args:
+            bandwidth (float or None):
+                カーネルの帯域幅。
+                None のときはデータから自動推定。
+        """
+        super().__init__()
+        self.bandwidth = bandwidth
+
+    def _get_bandwidth(self, dist2: torch.Tensor) -> torch.Tensor:
+        """
+        L2 距離^2 の行列から bandwidth を決めるヘルパー関数。
+        dist2: 形状 (N, N)
+        """
+        if self.bandwidth is not None:
+            # ユーザ指定がある場合はそれを使う
+            return torch.tensor(self.bandwidth, device=dist2.device, dtype=dist2.dtype)
+
+        n = dist2.shape[0]
+        if n <= 1:
+            # サンプルが1つ以下だと平均距離が定義できないので適当に1.0
+            return torch.tensor(1.0, device=dist2.device, dtype=dist2.dtype)
+
+        # 全要素（対角も含む）の平均距離^2 を bandwidth として使う簡易ヒューリスティック
+        # （より厳密にやるなら対角を除いたり，median heuristic にしてもよい）
+        bw = dist2.sum() / (n * n)
+        return bw.detach()
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        入力:
+            X: 形状 (N, D) の特徴ベクトル集合
+        出力:
+            K: 形状 (N, N) の RBF カーネル行列
+        """
+        # 全ペアの L2 距離^2 を計算
+        # torch.cdist(X, X) は (N, N) の距離行列を返す
+        dist2 = torch.cdist(X, X) ** 2  # (N, N)
+
+        bw = self._get_bandwidth(dist2)  # スカラー（tensor）
+        # k(x_i, x_j) = exp(- dist2 / bw)
+        K = torch.exp(- dist2 / (bw + 1e-8))
+        return K
+
+
+class MMDLoss(nn.Module):
+    """
+    RBF カーネルを用いた MMD^2 損失。
+    
+    MMD^2(X, Y) = E[k(X, X)] + E[k(Y, Y)] - 2 E[k(X, Y)]
+    
+    ここでは biased な推定量（全要素の単純平均）を用いています。
+    """
+
+    def __init__(self, kernel: nn.Module = None):
+        """
+        Args:
+            kernel: カーネルとして使うモジュール。
+                    デフォルトは上で定義した RBF。
+        """
+        super().__init__()
+        self.kernel = kernel if kernel is not None else RBF()
+
+    def forward(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            X: 形状 (N_x, D) のテンソル
+            Y: 形状 (N_y, D) のテンソル
+        Returns:
+            mmd2: スカラーの MMD^2
+        """
+        # X と Y を縦に連結して，まとめてカーネル行列を計算
+        Z = torch.vstack([X, Y])          # (N_x + N_y, D)
+        K = self.kernel(Z)                # (N_x + N_y, N_x + N_y)
+
+        n_x = X.shape[0]
+
+        # ブロックを切り出す
+        K_xx = K[:n_x, :n_x]              # X 対 X
+        K_xy = K[:n_x, n_x:]              # X 対 Y
+        K_yy = K[n_x:, n_x:]              # Y 対 Y
+
+        # 全要素の平均で expectation を近似
+        XX = K_xx.mean()
+        XY = K_xy.mean()
+        YY = K_yy.mean()
+
+        # MMD^2 = E[k(X,X)] - 2E[k(X,Y)] + E[k(Y,Y)]
+        mmd2 = XX - 2.0 * XY + YY
+        return mmd2
+
+
+# --------------------------------------------------
+# 3. MMD のバッチ内計算ヘルパー
+# --------------------------------------------------
+def compute_batch_mmd(feat: torch.Tensor,
+                      targets: torch.Tensor,
+                      real_features: dict,
+                      mmd_loss_fn: nn.Module,
+                      max_real_per_class: int = 100) -> torch.Tensor:
+    """
+    各クラス c について：
+      MMD^2( DI特徴_c , 実特徴_c ) を計算し，クラス平均を返す。
+    feat:    (bs, D)   DI 画像の特徴
+    targets: (bs,)     クラスID
+    """
+    uniq_classes = targets.unique().tolist()
+    mmd_list = []
+
+    for c in uniq_classes:
+        c_int = int(c)
+        # DI 側
+        mask_di = (targets == c)
+        feat_di_c = feat[mask_di]          # (n_c, D)
+        if feat_di_c.shape[0] == 0:
+            continue
+
+        # 実側
+        if c_int not in real_features:
+            continue
+        feat_real_c = real_features[c_int]  # (N_real, D) on CPU
+        if feat_real_c.shape[0] == 0:
+            continue
+
+        # 実側を max_real_per_class 個に制限（計算コスト対策）
+        if feat_real_c.shape[0] > max_real_per_class:
+            idx = torch.randperm(feat_real_c.shape[0])[:max_real_per_class]
+            feat_real_c = feat_real_c[idx]
+
+        feat_real_c = feat_real_c.to(feat.device)
+
+        # MMD^2 を計算
+        mmd2_c = mmd_loss_fn(feat_di_c, feat_real_c)
+        mmd_list.append(mmd2_c)
+
+    if len(mmd_list) == 0:
+        return torch.tensor(0.0, device=feat.device)
+    else:
+        return torch.stack(mmd_list).mean()
 
 
 class BASELINE_DIMMD(BaseLearner):
@@ -186,13 +342,16 @@ class BASELINE_DIMMD(BaseLearner):
 
 
         # MMD損失のために実画像の特徴を保存する
-        self.real_features = {c: [] for c in self.num_classes}
+        self.real_features = {c: [] for c in range(self.num_classes)}
+        self.real_features_tensor = None
+        self.num_features_per_class = args["num_features_per_class"]
 
 
 
     def after_task(self):
 
         # これまでに学習したクラス数の更新
+        self._pre_known_classes = self._known_classes    # 実画像の特徴保持にのみ使用
         self._known_classes = self._total_classes
         
         # 知識蒸留用の過去モデルを更新
@@ -204,12 +363,15 @@ class BASELINE_DIMMD(BaseLearner):
         
         # リプレイバッファの更新
         if self._memory_size > 0 and self.data_manager is not None:
-            
+
             # 1 クラスあたり何サンプル保持するか
             if self._memory_per_class is not None:
                 m = self._memory_per_class
             else:
                 m = self._memory_size // self._known_classes
+            
+            # 実画像の特徴量を保存
+            self.build_real_features(self.data_manager, m)
 
             logging.info(f"Update replay memory: m={m} per class")
             self.build_rehearsal_memory(self.data_manager, m)
@@ -228,6 +390,38 @@ class BASELINE_DIMMD(BaseLearner):
         # DI で生成した画像の保存
         if isinstance(self._data_memory, np.ndarray) and self._data_memory.size > 0:
             self._save_di_images(ckpt_dir)
+        
+        # 保存した実画像の特徴量の保存
+        target_classes = list(range(0, self._total_classes))
+
+        # 何も特徴が無い場合はスキップ
+        has_any = any(
+            isinstance(self.real_features[c], torch.Tensor)
+            and self.real_features[c].numel() > 0
+            for c in target_classes
+        )
+        if has_any:
+            # CPU に移して保存
+            real_feat_cpu = {
+                c: self.real_features[c].cpu()
+                for c in target_classes
+            }
+
+            save_obj = {
+                "features": real_feat_cpu,                 # dict: class_id -> (N_c, D)
+                "classes": target_classes,                 # 保存したクラスID
+                "num_features_per_class": self.num_features_per_class,
+            }
+
+            real_feat_path = os.path.join(
+                ckpt_dir, f"real_features_task{self._cur_task}.pth"
+            )
+            torch.save(save_obj, real_feat_path)
+            logging.info(f"Saved real features for MMD to: {real_feat_path}")
+        else:
+            logging.info("No real features to save for this task.")
+        
+
 
 
     def incremental_train(self, data_manager):
@@ -881,6 +1075,7 @@ class BASELINE_DIMMD(BaseLearner):
         targets = targets.to(self._device, non_blocking=True)
         return inputs, targets
 
+
     # ============================================================
     # 与えられたクラスラベル列に対して DeepInversion 画像を生成（ImageNet100）
     # ============================================================  
@@ -913,6 +1108,27 @@ class BASELINE_DIMMD(BaseLearner):
         first_bn_multiplier = 10
         do_flip = True
 
+        # ============================================
+        # プロトタイプを用意（通常のDeepInversionと異なる箇所）
+        # ============================================
+        protos_dict = self._protos  # {label: proto_vec}
+        proto_labels = sorted(protos_dict.keys())
+
+        # 各 proto を tensor にして並べる
+        protos_list = []
+        for c in proto_labels:
+            v = protos_dict[c]                         # np.array or torch.Tensor
+            v = torch.as_tensor(v, dtype=torch.float32)
+            protos_list.append(v)
+
+        protos_tensor = torch.stack(protos_list, dim=0).to(device=device)  # (C, D)
+
+        # ラベル → 行index のマップを作っておく
+        label2row = {c: i for i, c in enumerate(proto_labels)}
+        C, D = protos_tensor.shape
+        print("num protos:", C, "feat dim:", D)
+
+
         # teacher: after_task で更新した old_network を優先的に使う
         teacher = getattr(self, "old_network_module_ptr", None)
         if teacher is None:
@@ -930,7 +1146,7 @@ class BASELINE_DIMMD(BaseLearner):
         pooling_function = nn.modules.pooling.AvgPool2d(kernel_size=2)
         targets = torch.from_numpy(class_labels).to(device=device, dtype=torch.long)
         criterion = nn.CrossEntropyLoss()
-
+        mmd_loss_fn = MMDLoss()
 
         if setting_id==0:
             skipfirst = False
@@ -1005,6 +1221,74 @@ class BASELINE_DIMMD(BaseLearner):
                 # R_cross classification loss
                 loss = criterion(logits, targets)
 
+                # 特徴の多様性最大化損失（未完成）
+                feature = outputs["features"]
+                feat = feature.view(feature.size(0), -1)   # (bs, D)
+                # print('feature.shape: ', feature.shape)
+                # print("feat.shape: ", feat.shape)
+
+                bs = feat.size(0)
+
+                # ペアごとの差分ベクトル
+                # print("feat.unsqueeze(1).shape: ", feat.unsqueeze(1).shape)
+                # print("feat.unsqueeze(0).shape: ", feat.unsqueeze(0).shape)
+                diff = feat.unsqueeze(1) - feat.unsqueeze(0)   # (bs, bs, D)
+                dist2 = (diff ** 2).sum(dim=2)                 # (bs, bs), L2距離の二乗
+
+                # 同一クラスかどうかのマスク
+                same_label = (targets.unsqueeze(0) == targets.unsqueeze(1))  # (bs, bs) bool
+
+                # 自分自身 (i == j) のペアは除外
+                eye = torch.eye(bs, dtype=torch.bool, device=targets.device)
+                same_label = same_label & (~eye)
+
+                if same_label.any():
+                    same_dist2 = dist2[same_label]          # 同じクラス同士の距離だけ
+                    # 距離を「最大化」したいので，逆数を計算
+                    loss_div = 1.0 / same_dist2.mean()
+                else:
+                    loss_div = torch.zeros(1, device=feat.device)
+                
+
+                # --------------------------
+                # main loss 2: プロトタイプと平均特徴の損失（未完成）
+                # --------------------------
+                loss_proto_list = []
+
+                uniq_classes = targets.unique().tolist()
+                for c in uniq_classes:
+                    c_int = int(c)
+                    # このクラスの DI 特徴を集める
+                    mask_c = (targets == c)
+                    feat_c = feat[mask_c]                 # (n_c, D)
+                    if feat_c.shape[0] == 0:
+                        continue
+
+                    # クラス c の DI 特徴の平均 μ_c
+                    feat_mean_c = feat_c.mean(dim=0)      # (D,)
+
+                    # 対応するプロトタイプ p_c を取得
+                    if c_int not in label2row:
+                        continue
+                    proto_c = protos_tensor[label2row[c_int]]  # (D,)
+
+                    # μ_c と p_c の L2 距離^2
+                    loss_c = ((feat_mean_c - proto_c) ** 2).sum()
+                    loss_proto_list.append(loss_c)
+
+                if len(loss_proto_list) == 0:
+                    loss_proto = torch.tensor(0.0, device=feat.device)
+                else:
+                    # クラス平均
+                    loss_proto = torch.stack(loss_proto_list).mean()
+
+                
+                # --------------------------
+                # main loss 3: MMD (DI vs Real features)
+                # --------------------------
+                loss_mmd = compute_batch_mmd(feat, targets, self.real_features, mmd_loss_fn,
+                                            max_real_per_class=self.num_features_per_class)
+
                 # R_prior losses
                 loss_var_l1, loss_var_l2 = get_image_prior_losses(inputs_jit)
 
@@ -1021,13 +1305,16 @@ class BASELINE_DIMMD(BaseLearner):
                             r_feature_coeff * loss_r_feature + \
                             l2_coeff * loss_l2
                         
-                loss = main_loss_multiplier * loss + loss_aux
+                loss = main_loss_multiplier * loss + loss_aux + loss_div * self.di_feat_div + loss_proto * self.di_proto + loss_mmd * self.di_mmd
 
                 if iteration % 10 == 0:
                     logging.info(f"------------iteration {iteration}----------")
-                    logging.info(f"total loss: {loss.item():.4f}")
-                    logging.info(f"loss_r_feature: {loss_r_feature.item():.4f}")
-                    logging.info(f"main criterion: {criterion(logits, targets).item():.4f}")
+                    print("total loss", loss.item())
+                    print("loss_r_feature", loss_r_feature.item())
+                    print("loss_div", loss_div.item())
+                    print("loss_proto", loss_proto.item())
+                    print("loss_mmd", loss_mmd.item())
+                    print("main criterion", criterion(logits, targets).item())
                 
                 loss.backward()
                 optimizer.step()
@@ -1086,6 +1373,27 @@ class BASELINE_DIMMD(BaseLearner):
 
         lim_0, lim_1 = 2, 2
 
+        # ============================================
+        # プロトタイプを用意（通常のDeepInversionと異なる箇所）
+        # ============================================
+        protos_dict = self._protos  # {label: proto_vec}
+        proto_labels = sorted(protos_dict.keys())
+
+        # 各 proto を tensor にして並べる
+        protos_list = []
+        for c in proto_labels:
+            v = protos_dict[c]                         # np.array or torch.Tensor
+            v = torch.as_tensor(v, dtype=torch.float32)
+            protos_list.append(v)
+
+        protos_tensor = torch.stack(protos_list, dim=0).to(device=device)  # (C, D)
+
+        # ラベル → 行index のマップを作っておく
+        label2row = {c: i for i, c in enumerate(proto_labels)}
+        C, D = protos_tensor.shape
+        print("num protos:", C, "feat dim:", D)
+
+
         # teacher: after_task で更新した old_network を優先的に使う
         teacher = getattr(self, "old_network_module_ptr", None)
         if teacher is None:
@@ -1104,6 +1412,7 @@ class BASELINE_DIMMD(BaseLearner):
         targets = torch.from_numpy(class_labels).to(device=device, dtype=torch.long)
         optimizer = optim.Adam([inputs], lr=lr)
         criterion = nn.CrossEntropyLoss()
+        mmd_loss_fn = MMDLoss()
 
         # 学習部分
         best_cost = float("inf")
@@ -1119,10 +1428,77 @@ class BASELINE_DIMMD(BaseLearner):
             optimizer.zero_grad()
             teacher.zero_grad()
             outputs = teacher(inputs_jit)
+            
+            # 交差エントロピー損失
             logits_all = outputs["logits"]
             logits = logits_all[:, ::4] 
             loss = criterion(logits, targets)
-            loss_target = loss.item()
+
+            # 特徴の多様性最大化損失
+            feature = outputs["features"]
+            feat = feature.view(feature.size(0), -1)   # (bs, D)
+
+            bs = feat.size(0)
+
+            # ペアごとの差分ベクトル
+            # print("feat.unsqueeze(1).shape: ", feat.unsqueeze(1).shape)
+            # print("feat.unsqueeze(0).shape: ", feat.unsqueeze(0).shape)
+            diff = feat.unsqueeze(1) - feat.unsqueeze(0)   # (bs, bs, D)
+            dist2 = (diff ** 2).sum(dim=2)                 # (bs, bs), L2距離の二乗
+
+            # 同一クラスかどうかのマスク
+            same_label = (targets.unsqueeze(0) == targets.unsqueeze(1))  # (bs, bs) bool
+
+            # 自分自身 (i == j) のペアは除外
+            eye = torch.eye(bs, dtype=torch.bool, device=device)
+            same_label = same_label & (~eye)
+
+            if same_label.any():
+                same_dist2 = dist2[same_label]          # 同じクラス同士の距離だけ
+                # 距離を「最大化」したいので，逆数を計算
+                loss_div = 1.0 / same_dist2.mean()
+            else:
+                loss_div = torch.zeros(1, device=device)
+            
+
+            # --------------------------
+            # main loss 2: プロトタイプと平均特徴の損失（未完成）
+            # --------------------------
+            loss_proto_list = []
+
+            uniq_classes = targets.unique().tolist()
+            for c in uniq_classes:
+                c_int = int(c)
+                # このクラスの DI 特徴を集める
+                mask_c = (targets == c)
+                feat_c = feat[mask_c]                 # (n_c, D)
+                if feat_c.shape[0] == 0:
+                    continue
+
+                # クラス c の DI 特徴の平均 μ_c
+                feat_mean_c = feat_c.mean(dim=0)      # (D,)
+
+                # 対応するプロトタイプ p_c を取得
+                if c_int not in label2row:
+                    continue
+                proto_c = protos_tensor[label2row[c_int]]  # (D,)
+
+                # μ_c と p_c の L2 距離^2
+                loss_c = ((feat_mean_c - proto_c) ** 2).sum()
+                loss_proto_list.append(loss_c)
+
+            if len(loss_proto_list) == 0:
+                loss_proto = torch.tensor(0.0, device=device)
+            else:
+                # クラス平均
+                loss_proto = torch.stack(loss_proto_list).mean()
+
+            
+            # --------------------------
+            # main loss 3: MMD (DI vs Real features)
+            # --------------------------
+            loss_mmd = compute_batch_mmd(feat, targets, self.real_features, mmd_loss_fn,
+                                            max_real_per_class=self.num_features_per_class)
 
             # apply total variation regularization
             diff1 = inputs_jit[:,:,:,:-1] - inputs_jit[:,:,:,1:]
@@ -1138,13 +1514,16 @@ class BASELINE_DIMMD(BaseLearner):
 
             # l2 loss
             loss_l2 = torch.norm(inputs_jit, 2)
-            loss = loss + l2_coeff * loss_l2 
+            loss = loss + l2_coeff * loss_l2 + loss_div * self.di_feat_div + loss_proto * self.di_proto + loss_mmd * self.di_mmd
 
             if epoch % 10 == 0:
                 logging.info(f"------------iteration {epoch}----------")
-                logging.info(f"total loss: {loss.item():.4f}")
-                logging.info(f"loss_r_feature: {loss_distr.item():.4f}")
-                logging.info(f"main criterion: {criterion(logits, targets).item():.4f}")
+                print("total loss", loss.item())
+                print("loss_r_feature", loss_distr.item())
+                print("loss_div", loss_div.item())
+                print("loss_proto", loss_proto.item())
+                print("loss_mmd", loss_mmd.item())
+                print("main criterion", criterion(logits, targets).item())
                 
             loss.backward()
             optimizer.step()
@@ -1169,7 +1548,78 @@ class BASELINE_DIMMD(BaseLearner):
         
         return out
 
+    def build_real_features(self, data_manager, per_class):
+        """
+        DeepInversionの画像生成（mmd損失）に使用する実画像の特徴を計算し保存する．
+        保存先は self.real_features 
+        """
 
+        # --------------------------------------------------
+        # １．対象とするクラスの決定
+        # --------------------------------------------------
+        # 保存する特徴量の数（クラスごと）
+        n_per_class = self.num_features_per_class
+
+        # 保持対象とするクラス（今回のタスクで学習したクラス）
+        target_classes = list(range(self._pre_known_classes, self._total_classes))
+        # print("target_classes: ", target_classes)
+
+        # --------------------------------------------------
+        # ２．データローダーの作成
+        # --------------------------------------------------
+        real_dataset = self.data_manager.get_dataset(
+            indices=target_classes,
+            source="train",
+            mode="test",
+        )
+        real_loader = DataLoader(
+            real_dataset,
+            batch_size=128,
+            shuffle=True,
+            num_workers=4,
+        )
+
+        # --------------------------------------------------
+        # ３．モデルを評価モードに変更
+        # --------------------------------------------------
+        self._network.eval()
+
+        # --------------------------------------------------
+        # ４．特徴量を抽出
+        # --------------------------------------------------
+        with torch.no_grad():
+            for idx, images, labels in real_loader:
+                images = images.to(self._device)
+                labels = labels.to(self._device)
+
+                outputs = self._network(images)
+                feats = outputs["features"]
+                feats = feats.view(feats.size(0), -1)
+
+                # クラスごとに n_per_class 個まで集める
+                for f, y in zip(feats.cpu(), labels.cpu().tolist()):
+                    if y in self.real_features and len(self.real_features[y]) < n_per_class:
+                        self.real_features[y].append(f)
+
+                # すべてのクラスで目標数に達したらループ終了
+                if all(len(self.real_features[c]) >= n_per_class for c in target_classes):
+                    break
+        
+        # --------------------------------------------------
+        # ５．list を tensor に変換
+        # --------------------------------------------------
+        some_class = next(iter(target_classes))
+        if len(self.real_features[some_class]) > 0:
+            feat_dim = self.real_features[some_class][0].numel()
+        else:
+            feat_dim = 0
+        
+        for c in target_classes:
+            if len(self.real_features[c]) > 0:
+                self.real_features[c] = torch.stack(self.real_features[c], dim=0)
+            else:
+                self.real_features[c] = torch.empty(0, feat_dim)
+        
 
     # リプレイバッファの構築
     def build_rehearsal_memory(self, data_manager, per_class):
