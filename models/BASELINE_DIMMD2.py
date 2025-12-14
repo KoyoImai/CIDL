@@ -645,7 +645,7 @@ class BASELINE_DIMMD2(BaseLearner):
                 loss = loss_new + loss_fkd + loss_proto + loss_unl + loss_unl_mem
 
                 # ⑤ 追加: DI（保持クラス）専用の cosine 蒸留
-                if self._cur_task > 0 and self.args.get("lambda_di_cos", 0.0) > 0:
+                if self._cur_task > 0 and self.args.get("lambda_di_cos", 0.0) >= 0:
                     # di_inputs, di_targets = self._sample_retain_di_batch(
                     #     num_samples=self.args.get("retain_di_batch_size", 32)
                     # )
