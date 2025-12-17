@@ -106,6 +106,7 @@ class BASELINE_replay6(BaseLearner):
             self.args["increment"],
             self.args["lambda_fkd"], self.args["lambda_proto"], self.args["lambda_pes"], self.args["lambda_pgru"], self.args["lambda_unl"],)
         )
+    
     def incremental_train(self, data_manager):
         
         # data_managerの登録
@@ -235,8 +236,6 @@ class BASELINE_replay6(BaseLearner):
                 class_mean = np.mean(vectors, axis=0)
                 prototype[class_idx] = class_mean
             self._protos.update(prototype)
-
-
 
     def _train_function(self, train_loader, test_loader, optimizer, scheduler):
         
@@ -811,9 +810,5 @@ class BASELINE_replay6(BaseLearner):
             f"({n} per class for {len(target_classes)} future-forget classes, "
             f"skip already-forgotten={sorted(already_forgotten)})."
         )
-
-
-
-
 
 

@@ -1,11 +1,3 @@
-"""
-BASELINEアプローチにMMD損失などを追加したDeepInversionによる学習を追加したアプローチ
-
-・BASELINE_DIからの変更点
-　ー各クラスの実画像の特徴量をプロトタイプと同時に保存
-　ーDeepInversionの損失にMMD損失などを追加
-"""
-
 
 import os
 import random
@@ -174,7 +166,6 @@ class RBF(nn.Module):
         K = torch.exp(- dist2 / (bw + 1e-8))
         return K
 
-
 class MMDLoss(nn.Module):
     """
     RBF カーネルを用いた MMD^2 損失。
@@ -221,10 +212,7 @@ class MMDLoss(nn.Module):
         mmd2 = XX - 2.0 * XY + YY
         return mmd2
 
-
-# --------------------------------------------------
-# 3. MMD のバッチ内計算ヘルパー
-# --------------------------------------------------
+# MMD のバッチ内計算ヘルパー
 def compute_batch_mmd(feat: torch.Tensor,
                       targets: torch.Tensor,
                       real_features: dict,
@@ -271,43 +259,50 @@ def compute_batch_mmd(feat: torch.Tensor,
         return torch.stack(mmd_list).mean()
 
 
-class BASELINE_DIMMD2(BaseLearner):
+
+
+
+
+class BASELINE_DIMMD3(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
 
-        # backbone model の獲得
+        #=== Backbone model の獲得 ===#
         self._network = IncrementalNet(args, False)
         self._memory_data = []
         self._memory_targets = []
-        
-        # プロトタイプの初期化
+
+        #=== プロトタイプの初期化 ===#
         self._protos = {}
 
-        # 忘却クラス関連
-        self.forget_list = args["forget_cls"]   # タスクごとの忘却予定クラスリスト（外から与えられる）
-        self.forget_classes = []                # これまでの全タスクで忘却済みのクラス（累積）
-        self.cur_forget_classes = []            # このタスクで新たに忘却するクラス
+        #=== 使用する Unlearning / retain 損失の種類 ===#
+        # ex) "maxim_entropy"，"proto_cos", "minimum_cosine"
+        self.unleran_type = args["unlearn_type"]
 
-        # 将来まで含めた忘却クラスのリスト
+        # ex) "l2"
+        self.retain_type = args["retain_type"]
+
+        #=== 忘却クラス関連の処理 ===#
+        self.forget_list = args["forget_cls"]   # タスク毎の忘却予定リスト
+        self.forget_classes = []
+        self.cur_forget_classes = []
+
+        # 全ての忘却クラスをまとめたリスト
         self.all_forget_classes = sorted(
             {c for task in self.forget_list for c in task}
         )
 
-        # 1 クラスあたり保存するサンプル数 n（学習全体で一定）
+        #=== リプレイバッファ＆DeepInversion関係の設定 ===#
+        # 1クラスあたり保存するサンプル数 n
         mem_per_cls = args.get("memory_per_class", 0)
-
-        # DIMMD2 で使う「1クラスあたりのDI枚数」
-        self.forget_memory_per_class = mem_per_cls
-
-        # BaseLearner 側のロジック（after_task で m を決める）とも揃えるため、
-        # _memory_per_class も同じ値で上書きしておく
         self._memory_per_class = mem_per_cls
 
         # 学習に使用する DI画像 のバッチサイズ
-        self.retain_di_batch_size = args["retain_di_batch_size"]
+        self.retain_batch_size = args["retain_batch_size"]
+        self.forget_batch_size = args["forget_batch_size"]
 
-        # データセットのサイズを設定
+        #=== データセット関係の設定 ===#
         if "cifar" in self.args["dataset"]:
             self.size = 32
             self.num_classes = 100
@@ -318,20 +313,7 @@ class BASELINE_DIMMD2(BaseLearner):
             self.size = 224
             self.num_classes = 100
         
-        # 損失関数
-        self.pes_loss_func = PES_Loss()
-        self.old_ae = None
-
-        # ===== ランダム教師モデルの追加 =====
-        # 同じ構造のネットワークをランダム初期化したまま固定しておく
-        self._teacher = IncrementalNet(args, False)
-        self._teacher.to(self._device)
-        self._teacher.eval()
-        for p in self._teacher.parameters():
-            p.requires_grad = False
-        # ===============================
-
-        # ===== DeepInversion用の初期化を追加 =====
+        #=== DeepInversion用の初期化設定 ===#
         self.di_batch_size   = args["di_batch_size"]     
         self.di_iterations   = args["di_iterations"]  # 最適化ステップ数
         self.di_lr           = args["di_lr"]
@@ -344,41 +326,46 @@ class BASELINE_DIMMD2(BaseLearner):
         self.di_feat_div     = args["di_feat_div"]    # MMD損失の係数
         self.main_loss_multiplier = args["main_loss_multiplier"]
 
-
         # MMD損失のために実画像の特徴を保存する
         self.real_features = {c: [] for c in range(self.num_classes)}
         self.real_features_tensor = None
         self.num_features_per_class = args["num_features_per_class"]
 
-
+    #-------------------- タスク後の後処理 --------------------
     def after_task(self):
 
         # これまでに学習したクラス数の更新
-        self._pre_known_classes = self._known_classes    # 実画像の特徴保持にのみ使用
+        self._pre_known_classes = self._known_classes
         self._known_classes = self._total_classes
-        
-        # 知識蒸留用の過去モデルを更新
+
+        #=== 知識蒸留用教師モデルの更新 ===#
         self._old_network = self._network.copy().freeze()
         if hasattr(self._old_network,"module"):
             self.old_network_module_ptr = self._old_network.module
         else:
             self.old_network_module_ptr = self._old_network
         
-        # リプレイバッファの更新
-        if self._memory_size > 0 and self.data_manager is not None:
+        #=== リプレイバッファの更新 ===#
+        if self.data_manager is not None:
 
-            # 1 クラスあたり何サンプル保持するか
-            if self._memory_per_class is not None:
-                m = self._memory_per_class
-            else:
-                m = self._memory_size // self._known_classes
-            
+            # 1クラスあたり保存するサンプル数
+            m = self._memory_per_class
+
             # 実画像の特徴量を保存
-            self.build_real_features(self.data_manager, m)
+            self.build_real_features()
 
             logging.info(f"Update replay memory: m={m} per class")
             self.build_rehearsal_memory(self.data_manager, m)
 
+        #=== チェックポイントの保存 ===#
+        # ckpt_dir = "checkpoint/{}/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
+        #     self.args["model_name"],
+        #     self.args["log_name"],
+        #     self.args["dataset"],
+        #     self.args["unlearn_type"],
+        #     self.args["init_cls"],
+        #     self.args["increment"],
+        #     self.args["lambda_fkd"], self.args["lambda_proto"], self.args["lambda_pes"], self.args["lambda_pgru"], self.args["lambda_unl"])
         ckpt_dir = "checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
             self.args["model_name"],
             self.args["log_name"],
@@ -423,41 +410,42 @@ class BASELINE_DIMMD2(BaseLearner):
             logging.info(f"Saved real features for MMD to: {real_feat_path}")
         else:
             logging.info("No real features to save for this task.")
-        
 
+    #-------------------- 訓練関連の処理 --------------------
     def incremental_train(self, data_manager):
-        
-        # data_managerの登録
+
+        #=== data_manager の登録 ===#
         self.data_manager = data_manager
         self._cur_task += 1
 
-        # 元ラベルの順序
+        #=== 変更前のラベル順序を保存 ===#
         self._class_order = data_manager.get_class_order()
 
-        # 2タスク目で AutoEncoder を作成
-        if self._cur_task == 1:
-            self.old_ae = AutoencoderSigmoid(code_dims=512)
-            self.old_ae.to(self._device)
+        #=== 現在タスクのクラスまでを含めた合計のクラス数を更新 ===#
+        self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
 
-        # 現在タスクまでを含めた全てのクラス数を更新
-        self._total_classes = self._known_classes + \
-            data_manager.get_task_size(self._cur_task)
-        
-        # 忘却クラスの更新
-        # 今タスクで新たに忘却するクラス
+        #=== 忘却クラスの更新 ===#
+        # 現在タスクで新しく忘却するクラス
         self.cur_forget_classes = [cls for cls in self.forget_list[self._cur_task]]
-        # これまでの累積忘却クラス
+
+        # これまでに忘却したクラスの累積
         self.forget_classes += self.cur_forget_classes
 
+        # 前タスクまでに学習して，知識を維持したいクラスのリスト
+        self.learned_classes_list = [cls for cls in range(self._total_classes) if cls not in self.forget_classes]
+
+        # 忘却するクラスの表示
         logging.info(
             "forget classes on task{}: total={} (new={})".format(
                 self._cur_task, self.forget_classes, self.cur_forget_classes
             )
         )
 
-        # model の fc層 の出力次元数を変更
+        #=== model の構造を更新 ===#
         self._network.update_fc(self._total_classes*4)
         self._network_module_ptr = self._network
+        
+        # model の表示
         logging.info(
             "model: {}".format(self._network_module_ptr))
         logging.info(
@@ -467,53 +455,46 @@ class BASELINE_DIMMD2(BaseLearner):
         logging.info('Trainable params: {}'.format(
             count_parameters(self._network, True)))
 
-        # print("self._get_memory(): ", self._get_memory())
+        #=== dataloader の表示 ===#
+        # 訓練用データセットの作成
+        train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),
+                                                 source="train",
+                                                 mode="train",
+                                                 appendent=None)
 
-        # 現在タスクの訓練用データセットを作成
-        # train_dataset = data_manager.get_dataset(np.arange(self._known_classes,
-        #                                                    self._total_classes),
-        #                                                    source='train',
-        #                                                    mode='train',
-        #                                                    appendent=self._get_memory())
-        train_dataset = data_manager.get_dataset(np.arange(self._known_classes,
-                                                           self._total_classes),
-                                                           source='train',
-                                                           mode='train',
-                                                           appendent=None)
-        # 訓練用データローダーを作成
+        # 訓練用データローダーの作成
         self.train_loader = DataLoader(train_dataset,
                                        batch_size=self.args["batch_size"],
                                        shuffle=True,
                                        num_workers=self.args["num_workers"],
                                        pin_memory=True)
         
-        # テスト用データセットを作成
+        # テスト用データセットの作成
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes),
-                                                source='test',
-                                                mode='test')
+                                                source="test",
+                                                mode="test")
         
-        # テスト用データローダーを作成
+        # テスト用データローダーの作成
         self.test_loader = DataLoader(test_dataset,
                                       batch_size=self.args["batch_size"],
                                       shuffle=False,
                                       num_workers=self.args["num_workers"])
-
-        # 複数gpuが使用可能ならDPを適用
+        
+        # データパラレルの用意
         if len(self._multiple_gpus) > 1:
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
         
-        # 学習を実行
+        #=== 訓練を実行 ===#
         self._train(self.train_loader, self.test_loader)
 
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
-
     def _train(self, train_loader, test_loader):
-        
-        # デバッグ用かな？
+
+        #=== 学習済みパラメータの読み込み === #
         resume = False
-        if self._cur_task in [0]:
+        if self._cur_task in []:
             path = "checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/phase{}.pkl".format(
                 self.args["model_name"],
                 self.args["log_name"],
@@ -525,155 +506,145 @@ class BASELINE_DIMMD2(BaseLearner):
             self._network.load_state_dict(torch.load(path)["model_state_dict"])
             resume = True
             logging.info('!!!resume!!!')
-            # assert False
-        # assert False
         
-        # model を device に配置
+        #=== model をデバイス上に配置 ===#
         self._network.to(self._device)
         if hasattr(self._network, "module"):
             self._network_module_ptr = self._network.module
         
+        #=== タスクの学習 ===#
         if not resume:
-            # ベースタスクの場合
+
+            # ベースタスクの設定
             if self._cur_task == 0:
                 self._epoch_num = self.args["init_epochs"]
                 optimizer = torch.optim.Adam(self._network.parameters(), lr=self.args["init_lr"], weight_decay=self.args["weight_decay"])
                 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=self.args["step_size"], gamma=self.args["gamma"])
             
-            # 追加タスクの場合
+            # 追加タスクの設定
             else:
                 trainable_list = nn.ModuleList([])
                 trainable_list.append(self._network)
-                trainable_list.append(self.old_ae)
                 self._epoch_num = self.args["epochs"]
                 logging.info('All params total: {}'.format(count_parameters(trainable_list)))
                 optimizer = torch.optim.Adam(trainable_list.parameters(), lr=self.args["lr"], weight_decay=self.args["weight_decay"])
                 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=self.args["step_size"], gamma=self.args["gamma"])
+
+            # タスクの学習を実行
             self._train_function(train_loader, test_loader, optimizer, scheduler)
-        self._build_protos()
-            
         
+        #=== プロトタイプの構築 ===#
+        self._build_protos()
+
     def _build_protos(self):
+        
+        # プロトタイプの初期化
         prototype = {}
+
         with torch.no_grad():
             for class_idx in range(self._known_classes, self._total_classes):
-                data, targets, idx_dataset = self.data_manager.get_dataset(np.arange(class_idx, class_idx+1), source='train',
-                                                                    mode='test', ret_data=True)
-                idx_loader = DataLoader(idx_dataset, batch_size=self.args["batch_size"], shuffle=False, num_workers=4)
+                
+                # class_idx のデータセットを構築
+                data, targets, idx_dataset = self.data_manager.get_dataset(np.arange(class_idx, class_idx+1),
+                                                                           source="train",
+                                                                           mode="test",
+                                                                           ret_data=True)
+                # class_idx のデータローダーを構築
+                idx_loader = DataLoader(idx_dataset,
+                                        batch_size=self.args["batch_size"], 
+                                        shuffle=False,
+                                        num_workers=4)
+                
+                # class_idx の特徴量を取り出す
                 vectors, _ = self._extract_vectors(idx_loader)
-                class_mean = np.mean(vectors, axis=0)
-                prototype[class_idx] = class_mean
-            self._protos.update(prototype)
 
+                # class_idx の平均特徴を計算
+                class_mean = np.mean(vectors, axis=0)
+
+                # class_idx の平均特徴をプロトタイプとしてリストに追加
+                prototype[class_idx] = class_mean
+            
+            # プロトタイプの更新
+            self._protos.update(prototype)
 
     def _train_function(self, train_loader, test_loader, optimizer, scheduler):
 
-        retain_di_batch_size = self.retain_di_batch_size
-        
-        # progress barの表示
+        #=== プログレスバーの設定 ===#
         prog_bar = tqdm(range(self._epoch_num))
-        
-        # 決められた epoch 分だけ学習を実行
+
+        #=== 1エポックずつ学習 ===#
         for _, epoch in enumerate(prog_bar):
-            
-            # model を訓練モードに変更
+
+            #=== model を trainモード に変更
             self._network.train()
 
-            # 記録用変数の初期化
+            #=== 記録用変数の初期化 ===#
             losses = 0.
-            losses_new, losses_fkd, losses_proto, losses_unl, losses_unl_mem, losses_di_cos = 0., 0., 0., 0., 0., 0.
-            correct, total = 0, 0
+            losses_new = 0.
+            losses_fkd = 0.
+            losses_proto = 0.
+            losses_forg = 0.
+            losses_retain = 0.
 
-            # 1エポック分の学習を実行
+            correct = 0.
+            total = 0.
+
+            #=== 1エポックの学習 ===#
             for i, (_, inputs, targets) in enumerate(train_loader):
 
-                # -----------------------------
-                # ① 現タスクのバッチを GPU に載せる
-                # -----------------------------
-                inputs, targets = inputs.to(
-                    self._device, non_blocking=True), targets.to(self._device, non_blocking=True)
+                # ----------------------------------------
+                # ① 現在タスクのバッチを gpu に載せる
+                # ----------------------------------------
+                inputs = inputs.to(self._device, non_blocking=True)
+                targets = targets.to(self._device, non_blocking=True)
 
-                # -----------------------------
-                # ② リプレイメモリから忘却クラスをサンプリング
-                #    （現在タスクの forget_classes のみ）
-                # -----------------------------
-                mem_inputs, mem_targets = self._sample_forget_memory_batch(
-                    num_samples=self.args.get("forget_batch_size", 10),
-                    target_classes=self.cur_forget_classes,
+                # ----------------------------------------
+                # ② リプレイバッファから忘却用バッチを取り出す
+                # ----------------------------------------
+                mem_forg_inputs, mem_forg_targets = self._sample_memory_batch(
+                    num_samples=self.args.get("forget_batch_size", 32),
+                    target_classes=self.cur_forget_classes
                 )
-                # print("mem_targets: ", mem_targets)
+                # print("mem_forg_targets: ", mem_forg_targets)
 
-                # 取得できたら concat して一つのバッチにする
-                if mem_inputs is not None:
-                    inputs = torch.cat([inputs, mem_inputs], dim=0)
-                    targets = torch.cat([targets, mem_targets], dim=0)
-
-                # -----------------------------
-                # ②' リプレイメモリから「維持クラス」の DI をサンプリング
-                #     ・all_forget_classes に一度も出てこないクラスのみ
-                #     ・forget クラスとはクラス集合が被らないように
-                # -----------------------------
-                retain_di_inputs, retain_di_targets = None, None
-                if retain_di_batch_size > 0:
-                    retain_di_inputs, retain_di_targets = self._sample_retain_di_batch(
-                        num_samples=retain_di_batch_size
-                    )
-                # print("retain_di_targets: ", retain_di_targets)
+                # if mem_forg_inputs is not None:
+                #     inputs = torch.cat([inputs, mem_forg_inputs], dim=0)
+                #     targets = torch.cat([targets, mem_forg_targets], dim=0)
                 
+                # ----------------------------------------
+                # ③ リプレイバッファらから維持用バッチを取り出す
+                # ----------------------------------------
+                mem_retain_inputs, mem_retain_targets = self._sample_memory_batch(
+                    num_samples=self.args.get("retain_batch_size", 32),
+                    target_classes=self.learned_classes_list
+                )
+                # print("mem_retain_targets: ", mem_retain_targets)
 
-                if retain_di_inputs is not None:
-                    inputs = torch.cat([inputs, retain_di_inputs], dim=0)
-                    targets = torch.cat([targets, retain_di_targets], dim=0)
-                
-                # -----------------------------
-                # ③ rotation をかけて class augmentation
-                #    （現バッチ + リプレイバッチの両方に適用）
-                # -----------------------------
+                # if mem_retain_inputs is not None:
+                #     inputs = torch.cat([inputs, mem_retain_inputs], dim=0)
+                #     targets = torch.cat([targets, mem_retain_targets], dim=0)
+
+                # ----------------------------------------
+                # ④ rotation をかけて class augmentation
+                # ----------------------------------------
+                # 訓練用データに回転拡張を適用
                 inputs = torch.stack([torch.rot90(inputs, k, (2, 3)) for k in range(4)], 1)
                 inputs = inputs.view(-1, 3, self.size, self.size)
 
                 # class augmentation に合わせてラベルを修正
                 aug_targets = torch.stack([targets * 4 + k for k in range(4)], 1).view(-1)
-                
-                # -----------------------------
-                # ④ 損失計算（_compute_prl_loss はそのまま再利用）
-                #    - CE: retain_mask（忘却以外）
-                #    - loss_unl: forget_mask（今タスクの忘却クラス）
-                # -----------------------------
-                logits, loss_new, loss_fkd, loss_proto, loss_unl, loss_unl_mem = self._compute_prl_loss(inputs, targets, aug_targets)
-                loss = loss_new + loss_fkd + loss_proto + loss_unl + loss_unl_mem
 
-                # ⑤ 追加: DI（保持クラス）専用の cosine 蒸留
-                if self._cur_task > 0 and self.args.get("lambda_di_cos", 0.0) >= 0:
-                    # di_inputs, di_targets = self._sample_retain_di_batch(
-                    #     num_samples=self.args.get("retain_di_batch_size", 32)
-                    # )
-                    if retain_di_inputs is not None:
-                        retain_di_inputs  = retain_di_inputs.to(self._device, non_blocking=True)
-                        retain_di_targets = retain_di_targets.to(self._device, non_blocking=True)
+                # ----------------------------------------
+                # ⑤ 損失を計算
+                # ----------------------------------------
+                logits, loss_new, loss_fkd, loss_proto, loss_di_forg, loss_di_retain = self._compute_loss(inputs, targets, aug_targets,
+                                                                                                          mem_forg_inputs, mem_forg_targets,
+                                                                                                          mem_retain_inputs, mem_retain_targets)
+                loss = loss_new + loss_fkd + loss_proto + loss_di_forg + loss_di_retain
 
-                        # 忘却クラスはここでは蒸留しない（保持クラスだけ）
-                        retain_mask_di = ~torch.isin(retain_di_targets, torch.tensor(
-                            self.forget_classes, device=self._device
-                        ))
-
-                        if retain_mask_di.any():
-                            di_inputs_ret = retain_di_inputs[retain_mask_di]
-
-                            with torch.no_grad():
-                                feat_old_di = self.old_network_module_ptr.extract_vector(di_inputs_ret)
-                            feat_new_di = self._network_module_ptr.extract_vector(di_inputs_ret)
-
-                            # cosine 用に L2 正規化
-                            feat_old_di = F.normalize(feat_old_di, p=2, dim=1)
-                            feat_new_di = F.normalize(feat_new_di, p=2, dim=1)
-
-                            cos_sim = (feat_old_di * feat_new_di).sum(dim=1)  # [N]
-                            loss_di_cos = (1.0 - cos_sim).mean()
-
-                            loss = loss + self.args["lambda_di_cos"] * loss_di_cos
-                                
-                # パラメータ更新
+                # ----------------------------------------
+                # ⑥ パラメータを更新
+                # ----------------------------------------
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -683,9 +654,8 @@ class BASELINE_DIMMD2(BaseLearner):
                 losses_new += loss_new.item()
                 losses_fkd += loss_fkd.item()
                 losses_proto += loss_proto.item()
-                losses_unl += loss_unl.item()
-                losses_unl_mem += loss_unl_mem.item()
-                losses_di_cos += loss_di_cos.item()
+                losses_forg += loss_di_forg.item()
+                losses_retain += loss_di_retain.item()
 
                 # 正解率の計算
                 _, preds = torch.max(logits, dim=1)
@@ -696,89 +666,51 @@ class BASELINE_DIMMD2(BaseLearner):
             scheduler.step()
             train_acc = np.around(tensor2numpy(
                 correct)*100 / total, decimals=2)
-            
-            # 5 epoch 毎に精度や損失などを表示
+
+            # 5 エポック毎に精度や損失を表示
             if epoch % 5 != 0:
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Loss_di_cos {:.3f}, Train_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_unl/len(train_loader), losses_di_cos/len(train_loader), train_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Loss_retain {:.3f}, Train_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_forg/len(train_loader), losses_retain/len(train_loader), train_acc)
             else:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Loss_di_cos {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_unl/len(train_loader), losses_di_cos/len(train_loader), train_acc, test_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Loss_retain {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_forg/len(train_loader), losses_retain/len(train_loader), train_acc, test_acc)
             prog_bar.set_description(info)
             logging.info(info)
 
+    def _compute_loss(self, inputs, targets, aug_targets, mem_forg_inputs, mem_forg_targets, mem_retain_inputs, mem_retain_targets):
 
-    def _contras_loss(self, features, features_old):
-
-        # 整合損失: AE（旧feature）と現在featureのMSE
-        features_old = self.old_ae(features_old)
-        loss_align = nn.MSELoss()(features, features_old)
-        
-        # 直交損失: AE(protos) と AE(旧feature) の cosine を下げる
-        features_old_norm = F.normalize(features_old, p=2, dim=1)
-
-        # 忘却クラスのプロトタイプの前準備
-        valid_protos = [
-            proto for cls_id, proto in self._protos.items()
-            if cls_id not in self.forget_classes
-        ]
-
-        if len(valid_protos) == 0:
-            # 直交させる相手がいないので align 項だけにする
-            return loss_align
-
-        protos = np.asarray(valid_protos)  # shape: [num_valid_classes, D]
-        protos = torch.from_numpy(protos).float().to(self._device, non_blocking=True)
-        protos = self.old_ae(protos)       # AutoEncoderで射影
-        protos = F.normalize(protos, p=2, dim=1)
-
-        # # プロトタイプの準備（not Machine Unlearning用）
-        # protos = self._protos.values()             # 各クラスのプロトタイプ
-        # protos = torch.from_numpy(np.asarray(list(protos))).float().to(self._device,non_blocking=True)
-        # protos = self.old_ae(protos)               # AutoEncoderで射影
-        # protos = F.normalize(protos, p=2, dim=1)
-
-        similarity = torch.matmul(protos, features_old_norm.t())
-        similarity = similarity.sum() / (similarity.shape[0]*similarity.shape[1])
-        
-        return loss_align + similarity
-
-
-    # 損失計算
-    def _compute_prl_loss(self, inputs, targets, aug_targets):
-        """
-        BASELINE_replay 版からの変更点:
-          - CE は「忘却対象でない」サンプルだけで計算
-          - KL→一様分布の unlearning loss は「忘却対象の」サンプルだけで計算
-          - replay メモリのサンプルも train_loader に混ざっているので，
-            ここでは単にラベルで判定するだけでよい。
-        """
+        # 損失計算の前準備
         cur_forget = set(getattr(self, "cur_forget_classes", []))
         lambda_unl = self.args.get("lambda_unl", 0.0)
 
-        # 特徴 & logits
+        #=== forward処理を行い features / logits を取り出す ===#
         features = self._network_module_ptr.extract_vector(inputs)      # [4B, D]
         logits = self._network_module_ptr.fc(features)["logits"]        # [4B, C*4]
 
-        # ---------- base task: 普通に CE のみ ----------
+        # === base task: Cross Entropy Loss だけ計算 ===#
         if self._cur_task == 0:
-            loss_clf = torch.nn.functional.cross_entropy(
+
+            # CE損失を計算
+            loss_new = torch.nn.functional.cross_entropy(
                 logits / self.args["temp"], aug_targets
             )
-            loss_new = loss_clf
+
+            # ベースタスクで使用しない損失は 0 で埋める
             loss_fkd = torch.tensor(0., device=self._device)
             loss_proto = torch.tensor(0., device=self._device)
-            loss_unl = torch.tensor(0., device=self._device)
-            loss_unl_mem = torch.tensor(0., device=self._device)
-            return logits, loss_new, loss_fkd, loss_proto, loss_unl, loss_unl_mem
+            loss_forg = torch.tensor(0., device=self._device)
+            loss_retain = torch.tensor(0., device=self._device)
 
+            return logits, loss_new, loss_fkd, loss_proto, loss_forg, loss_retain
 
-        # ---------- 忘却 / 保持サンプルのマスクを作る ----------
+        #=== 忘却 / 保持サンプルのマスクを作成 ===#
+        # バッチサイズ
         B = targets.shape[0]
 
         if len(cur_forget) > 0:
-            # [B] : このバッチの元サンプルが忘却対象かどうか
+
+            # バッチの元サンプルが忘却対象かどうかを判定
             tgt_np = targets.detach().cpu().numpy()
             forget_flags = np.isin(tgt_np, np.array(list(cur_forget)))
             forget_flags = torch.from_numpy(forget_flags).to(self._device)  # bool [B]
@@ -787,39 +719,48 @@ class BASELINE_DIMMD2(BaseLearner):
             forget_mask = torch.stack(
                 [forget_flags for _ in range(4)], dim=1
             ).view(-1)  # bool [4B]
+        
         else:
             forget_mask = torch.zeros(logits.shape[0], dtype=torch.bool, device=self._device)
 
         retain_mask = ~forget_mask
 
-        # ---------- incremental task ----------
-        # まず Feature KD（保持クラス全体に対して）
+        #=== 蒸留損失の計算 ===#
+        # 教師モデルの出力を獲得
         with torch.no_grad():
             features_old = self.old_network_module_ptr.extract_vector(inputs)
         
+        # マスクを使用して保持クラスの出力だけ取り出す
         if retain_mask.any():
             f_new = features[retain_mask]
             f_old = features_old[retain_mask]
             loss_fkd = self.args["lambda_fkd"] * torch.dist(f_new, f_old, 2)
         else:
             loss_fkd = torch.tensor(0., device=self._device)
-
-        # Prototype rehearsal（保持クラスのみ、BASELINE_replay と同じ）
+        
+        #=== プロトタイプ損失の計算 ===#
         proto_features = []
         proto_targets = []
 
+        # 忘却するクラスのプロトタイプは使用しない
         old_class_list = list(self._protos.keys())
-        # 忘却クラスは prototype rehearsal には使わない
         old_class_list = [c for c in old_class_list if c not in self.forget_classes]
 
+        # 維持クラスの出力を選択するためにインデックスを取り出す
         retain_indices = torch.nonzero(retain_mask).view(-1).cpu().numpy()
 
         if len(old_class_list) == 0:
             loss_proto = torch.tensor(0., device=self._device)
         else:
             for _ in range(features.shape[0] // 4):
+
+                # 取り出す画像特徴のインデックス i をランダムに選択
                 i = np.random.choice(retain_indices)
+
+                # 使用するプロトタイプをランダムに選択
                 np.random.shuffle(old_class_list)
+
+                # プロトタイプと画像特徴を mixup
                 lam = np.random.beta(0.5, 0.5)
                 if lam > 0.6:
                     lam = lam * 0.6
@@ -828,9 +769,11 @@ class BASELINE_DIMMD2(BaseLearner):
                 else:
                     temp = (1 - lam) * self._protos[old_class_list[0]]  + lam * features.detach().cpu().numpy()[i]
                 
+                # mixup した特徴をリストに格納
                 proto_features.append(temp)
                 proto_targets.append(old_class_list[0])
 
+            # 特徴とラベルを numpy から tensor に変更
             proto_features = torch.from_numpy(np.asarray(proto_features)).float().to(
                 self._device, non_blocking=True
             )
@@ -838,14 +781,13 @@ class BASELINE_DIMMD2(BaseLearner):
                 self._device, non_blocking=True
             )
 
+            # mixup 後の特徴量を fc層 に入力しプロトタイプ損失を計算
             proto_logits = self._network_module_ptr.fc(proto_features)["logits"]
             loss_proto = self.args["lambda_proto"] * torch.nn.functional.cross_entropy(
                 proto_logits / self.args["temp"], proto_targets * 4
             )
-
         
-
-        # ---------- CE: 忘却対象でないサンプルのみ ----------
+        #=== 維持クラスのみ対象にした Cross Entropy Loss を計算 ===#
         if retain_mask.any():
             logits_retain = logits[retain_mask]
             targets_retain = aug_targets[retain_mask]
@@ -854,335 +796,204 @@ class BASELINE_DIMMD2(BaseLearner):
             )
         else:
             loss_clf = torch.tensor(0., device=self._device)
-
+        
         loss_new = loss_clf
 
+        #=== DeepInversionで生成した忘却クラスのみを対象とする忘却損失 ===#
+        loss_forg = torch.tensor(0., device=self._device)
 
-        # ---------- Unlearning: 忘却クラスの特徴をそのクラスの prototype から引き離す ----------
-        loss_unl_inputs = torch.tensor(0., device=self._device)
-        if lambda_unl > 0 and forget_mask.any():
-            # aug_targets は [4B] の "rotation付きクラスID" なので
-            # 元のクラスIDに戻す（C*4 次元のうち 4 で割る）
-            base_cls_ids = (aug_targets // 4).to(self._device)   # [4B]
+        # mem_forg_inputs の forward 処理
+        forg_features = self._network_module_ptr.extract_vector(mem_forg_inputs)  
+        forg_logits = self._network_module_ptr.fc(forg_features)["logits"] 
 
-            # 忘却対象サンプルだけ取り出す
-            forget_features = features[forget_mask]              # [N_forget, D]
-            forget_cls_ids = base_cls_ids[forget_mask]           # [N_forget]
+        # 同じクラス c の特徴量のコサイン類似度を最小化することで忘却を発生する
+        if self.args["unlearn_type"] == "minimum_cosine":
+            feat = torch.nn.functional.normalize(forg_features, dim=1)  # [N, D]
+            uniq = torch.unique(mem_forg_targets)
 
-            # 対応する prototype を 1 サンプルずつ並べる
-            forget_cls_ids_np = forget_cls_ids.detach().cpu().numpy()
-            proto_list = []
-            for c in forget_cls_ids_np:
-                c_int = int(c)
-                assert c_int in self._protos, f"prototype for class {c_int} not found"
-                proto_list.append(self._protos[c_int])           # np.array(D,)
+            per_class_means = []
+            for c in uniq:
+                idx = (mem_forg_targets == c)
+                n_c = int(idx.sum().item())
+                if n_c < 2:
+                    continue
 
-            protos_forget = torch.from_numpy(
-                np.stack(proto_list, axis=0)                     # [N_forget, D]
-            ).float().to(self._device, non_blocking=True)
+                f = feat[idx]          # [n_c, D]
+                sim = f @ f.t()        # [n_c, n_c] (cos sim)
+                
+                # 対角(i=j)を除外して平均
+                offdiag = sim[~torch.eye(n_c, dtype=torch.bool, device=sim.device)]
+                per_class_means.append(offdiag.mean())
 
-            # L2 normalize して cosine similarity を計算
-            f_norm = F.normalize(forget_features, p=2, dim=1)    # [N_forget, D]
-            p_norm = F.normalize(protos_forget,  p=2, dim=1)     # [N_forget, D]
+            if len(per_class_means) > 0:
+                l_sim = torch.stack(per_class_means).mean()
+                # 係数：lambda_forg があればそれ、なければ lambda_unl を流用
+                
+                loss_forg = self.args["lambda_forg"] * l_sim
+        
+        else:
+            assert False
 
-            cos_sim = (f_norm * p_norm).sum(dim=1)               # [N_forget]
+        #=== DeepInversionで生成した維持クラスのみを対象とする蒸留損失 ===#
+        loss_retain = torch.tensor(0., device=self._device)
+        
+        # 学習中モデルの forward 処理
+        retain_features = self._network_module_ptr.extract_vector(mem_retain_inputs) 
+        retain_logits = self._network_module_ptr.fc(retain_features)["logits"]
 
-            # 平均 cosine を小さくする（= prototype から引き離す）
-            loss_unl_inputs = lambda_unl * cos_sim.mean()
-
-        loss_unl = loss_unl_inputs
-        loss_unl_mem = torch.tensor(0., device=self._device)
-
-        return logits, loss_new, loss_fkd, loss_proto, loss_unl, loss_unl_mem
-
-    def _compute_accuracy(self, model, loader):
-        model.eval()
-        correct, total = 0, 0
-        for i, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.to(self._device)
+        # L2 ノルムによる蒸留損失
+        if self.retain_type == "l2":
+            
+            # パラメータを凍結した過去モデル
             with torch.no_grad():
-                outputs = model(inputs)["logits"][:, ::4]
-            predicts = torch.max(outputs, dim=1)[1]
-            correct += (predicts.cpu() == targets).sum()
-            total += len(targets)
-
-        return np.around(tensor2numpy(correct)*100 / total, decimals=2)
-
-    def _eval_cnn(self, loader):
-        self._network.eval()
-        y_pred, y_true = [], []
-        for _, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.to(self._device)
-            with torch.no_grad():
-                outputs = self._network(inputs)["logits"][:, ::4]
-            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]  
-            y_pred.append(predicts.cpu().numpy())
-            y_true.append(targets.cpu().numpy())
-
-        return np.concatenate(y_pred), np.concatenate(y_true)  
-    
-    def eval_task(self):
-        # -------------------------
-        # CNN 評価（保持クラスだけ）
-        # -------------------------
-        y_pred, y_true = self._eval_cnn(self.test_loader)
-        y_true = np.asarray(y_true)
-
-        # 忘却クラス / 保持クラスの分割
-        forget_set = set(getattr(self, "forget_classes", []))
-        if len(forget_set) > 0:
-            mask_forget = np.isin(y_true, list(forget_set))
-        else:
-            mask_forget = np.zeros_like(y_true, dtype=bool)
-        mask_retain = ~mask_forget
-
-        # 保持クラスのみで CNN の精度を計算
-        if mask_retain.any():
-            y_pred_retain = y_pred[mask_retain]
-            y_true_retain = y_true[mask_retain]
-        else:
-            logging.warning(
-                "MU eval (CNN): no retain samples found, using all samples for metrics."
-            )
-            y_pred_retain = y_pred
-            y_true_retain = y_true
+                retain_features_old = self.old_network_module_ptr.extract_vector(mem_retain_inputs)
+            
+            # retain損失の計算
+            loss_retain = self.args["lambda_retain"] * torch.dist(retain_features, retain_features_old)
         
-        cnn_accy = self._evaluate(y_pred_retain, y_true_retain)
-
-        # 忘却クラスの精度（CNN）
-        if mask_forget.any():
-            top1_pred_forget = y_pred[mask_forget][:, 0]
-            true_forget = y_true[mask_forget]
-            forget_acc_cnn = np.around(
-                (top1_pred_forget == true_forget).sum() * 100.0 / len(true_forget),
-                decimals=2,
-            )
         else:
-            forget_acc_cnn = None
-        
-        # 追加情報として dict に入れておく（trainer は今のままで OK）
-        cnn_accy["forget_top1"] = forget_acc_cnn
-        cnn_accy["num_retain_samples"] = int(mask_retain.sum())
-        cnn_accy["num_forget_samples"] = int(mask_forget.sum())
+            assert False
 
-        logging.info(
-            f"MU eval (CNN) - retain samples: {mask_retain.sum()}, "
-            f"forget samples: {mask_forget.sum()}"
-        )
-        logging.info(f"MU eval (CNN) - forget top1: {forget_acc_cnn}")
 
-        ### CNN の調和平均
-        retain_acc_cnn = cnn_accy["top1"]
+        return logits, loss_new, loss_fkd, loss_proto, loss_forg, loss_retain
 
-        if forget_acc_cnn is not None:
-            forget_err_cnn = 100.0 - forget_acc_cnn
-            if retain_acc_cnn + forget_err_cnn > 0:
-                hmean_cnn = 2.0 * retain_acc_cnn * forget_err_cnn / (retain_acc_cnn + forget_err_cnn)
-            else:
-                hmean_cnn = 0.0
-        else:
-            forget_err_cnn = None
-            hmean_cnn = None
-        
-        # dict に保存しておく（必要なら trainer から拾える）
-        cnn_accy["forget_err"] = forget_err_cnn
-        cnn_accy["hmean"] = hmean_cnn
 
-        logging.info(
-            f"MU (CNN) retain_acc={retain_acc_cnn:.2f}, "
-            f"forget_err={forget_err_cnn}, hmean={hmean_cnn}"
-        )
-
-        # -------------------------
-        # NME 評価（保持クラスだけ）
-        # -------------------------
-        nme_accy = None
-        y_pred_nme, y_true_nme = None, None
-
-        if hasattr(self, "_protos") and len(self._protos) > 0:
-            # protos を class means として使う場合
-            protos = np.asarray(list(self._protos.values()))
-            protos = protos / (np.linalg.norm(protos, axis=1, keepdims=True) + 1e-8)
-            y_pred_nme, y_true_nme = self._eval_nme(self.test_loader, protos)
-        
-        if y_pred_nme is not None:
-            y_true_nme = np.asarray(y_true_nme)
-
-            if len(forget_set) > 0:
-                mask_forget_nme = np.isin(y_true_nme, list(forget_set))
-            else:
-                mask_forget_nme = np.zeros_like(y_true_nme, dtype=bool)
-            mask_retain_nme = ~mask_forget_nme
-
-            # 保持クラスのみで NME の精度を計算
-            if mask_retain_nme.any():
-                y_pred_retain_nme = y_pred_nme[mask_retain_nme]
-                y_true_retain_nme = y_true_nme[mask_retain_nme]
-            else:
-                logging.warning(
-                    "MU eval (NME): no retain samples found, using all samples for metrics."
-                )
-                y_pred_retain_nme = y_pred_nme
-                y_true_retain_nme = y_true_nme
-
-            nme_accy = self._evaluate(y_pred_retain_nme, y_true_retain_nme)
-
-            # 忘却クラスの精度（NME）
-            if mask_forget_nme.any():
-                top1_pred_forget_nme = y_pred_nme[mask_forget_nme][:, 0]
-                true_forget_nme = y_true_nme[mask_forget_nme]
-                forget_acc_nme = np.around(
-                    (top1_pred_forget_nme == true_forget_nme).sum()
-                    * 100.0
-                    / len(true_forget_nme),
-                    decimals=2,
-                )
-            else:
-                forget_acc_nme = None
-
-            nme_accy["forget_top1"] = forget_acc_nme
-            nme_accy["num_retain_samples"] = int(mask_retain_nme.sum())
-            nme_accy["num_forget_samples"] = int(mask_forget_nme.sum())
-
-            logging.info(f"MU eval (NME) - forget top1: {forget_acc_nme}")
-
-            ### NME の調和平均
-            retain_acc_nme = nme_accy["top1"]  # 保持クラスのみで計算した top1 (%)
-
-            if forget_acc_nme is not None:
-                forget_err_nme = 100.0 - forget_acc_nme
-                if retain_acc_nme + forget_err_nme > 0:
-                    hmean_nme = 2.0 * retain_acc_nme * forget_err_nme / (retain_acc_nme + forget_err_nme)
-                else:
-                    hmean_nme = 0.0
-            else:
-                forget_err_nme = None
-                hmean_nme = None
-
-            nme_accy["forget_err"] = forget_err_nme
-            nme_accy["hmean"] = hmean_nme
-
-            logging.info(
-                f"MU (NME) retain_acc={retain_acc_nme:.2f}, "
-                f"forget_err={forget_err_nme}, hmean={hmean_nme}"
-            )
-
-        return cnn_accy, nme_accy
-   
-
-    # 忘却クラスのデータのみを取り出してミニバッチを作成する関数
-    def _sample_forget_memory_batch(self, num_samples, target_classes=None):
+    #-------------------- リプレイバッファ関連の処理 --------------------
+    def _sample_memory_batch(self, num_samples, target_classes=None):
         """
         self._data_memory / self._targets_memory から
         target_classes（指定がなければ self.forget_classes）に属するサンプルだけを
-        ランダムに num_samples 個取り出して 1 バッチ分の (inputs, targets) を返す。
-
-        メモリ or 対象クラスが空のときは (None, None) を返す。
+        ランダムに num_samples 個取り出して 1 バッチ分の (inputs, targets) を返す
         """
-        # メモリがまだ空なら何もしない
+
+        #=== メモリがからの時は何もしない ===#
         if not hasattr(self, "_data_memory") or self._data_memory.size == 0:
             return None, None
-
-        # 対象クラス集合の決定（指定がなければ累積 forget_classes）
-        if target_classes is None:
-            target_classes = self.forget_classes
-
-        # 対象クラスが指定されていない or 空なら何もしない
+        
+        #=== 対照クラスが指定されていないなら何もしない ===#
         if target_classes is None or len(target_classes) == 0:
             return None, None
 
-        # numpy の targets から target_classes に属する index を抜き出す
+        #=== numpy の targets から target_classes に属する index を抜き出す ===#
         mask = np.isin(self._targets_memory, np.array(target_classes))
         idxs = np.where(mask)[0]
         if len(idxs) == 0:
             return None, None
-
+        
+        #=== self._data_memory / self._targets_memory から取り出す ===#
+        # サンプル数の決定
         num = min(num_samples, len(idxs))
+        
+        # 取り出すサンプルのインデックスをランダムに決定
         sampled = np.random.choice(idxs, size=num, replace=False)
 
-        forget_data = self._data_memory[sampled]
-        forget_targets = self._targets_memory[sampled]
+        # データとラベルを取り出す
+        mem_data = self._data_memory[sampled]
+        mem_targets = self._targets_memory[sampled]
 
-        # DataManager 経由で Dataset を作って，普段と同じ transform をかける
-        forget_dataset = self.data_manager.get_dataset(
-            [],                           # 元データからは何も取らない
+        #=== DataManager 経由で学習用データを整形 ===#
+        # リプレイ用データセットの作成
+        mem_dataset = self.data_manager.get_dataset(
+            [],
             source="train",
-            mode="test",                  # ここは test / train どちらでもよいが，とりあえず test で固定
-            appendent=(forget_data, forget_targets),
+            mode="test",
+            appendent=(mem_data, mem_targets),
             setup_replay=False,
         )
-        forget_loader = DataLoader(
-            forget_dataset,
+
+        # リプレイ用データローダーの作成
+        mem_loader = DataLoader(
+            mem_dataset,
             batch_size=num,
             shuffle=True,
             num_workers=self.args["num_workers"],
             pin_memory=True,
         )
 
-        # 1 バッチだけ取り出す
-        _, inputs, targets = next(iter(forget_loader))
+        # リプレイ用ミニバッチを取り出す
+        _, inputs, targets = next(iter(mem_loader))
         inputs = inputs.to(self._device, non_blocking=True)
         targets = targets.to(self._device, non_blocking=True)
-        return inputs, targets
+        return inputs, targets           
 
+    def build_rehearsal_memory(self, data_manager, per_class):
 
-    # 維持クラスのデータのみを取り出してミニバッチを作成する
-    def _sample_retain_di_batch(self, num_samples):
-        """
-        [DIMMD2] self._data_memory から
-        「保持クラス（forget_list に一度も出てこないクラス）」の
-        DI だけをサンプリングして返す。
-        """
-        if not hasattr(self, "_data_memory") or self._data_memory.size == 0:
-            return None, None
+        #=== 保持サンプル数が0なら終了 ===#
+        n = int(per_class)
+        if n <= 0:
+            logging.info("[DI-DIMMD2] Skip building DI memory (n <= 0).")
+            self._data_memory = np.array([], dtype=np.uint8)
+            self._targets_memory = np.array([], dtype=np.int64)
+            return
+        
+        #=== 対象とするクラスの決定 ===#
+        # すでに忘却済みのクラス
+        already_forgotten = set(getattr(self, "forget_classes", []))
 
-        # 全クラスの中で、一度も forget_list に出てこないクラス集合
-        all_forget = set(self.all_forget_classes)
-        retain_global = [
-            c for c in range(self._total_classes)
-            if c not in all_forget
+        # DIで生成するクラス（現在のタスクで学習したクラスに限定）
+        target_classes = [
+            c for c in range(self._pre_known_classes, self._total_classes)
         ]
-        if len(retain_global) == 0:
-            return None, None
 
-        targets_np = self._targets_memory
-        mask = np.isin(targets_np, np.array(retain_global))
-        idxs = np.where(mask)[0]
-        if len(idxs) == 0:
-            return None, None
-
-        num = min(num_samples, len(idxs))
-        sampled = np.random.choice(idxs, size=num, replace=False)
-
-        di_data = self._data_memory[sampled]
-        di_targets = targets_np[sampled]
-
-        # DataManager 経由で tensor 化
-        dataset = self.data_manager.get_dataset(
-            [],
-            source="train",
-            mode="test",
-            appendent=(di_data, di_targets),
-            setup_replay=False,
+        logging.info(
+            f"[DI-DIMMD] Building DI memory for ALL non-forgotten classes: "
+            f"n={n} per class, target_classes={target_classes}, "
+            f"already_forgotten={sorted(already_forgotten)}"
         )
-        loader = DataLoader(
-            dataset,
-            batch_size=num,
-            shuffle=False,
-            num_workers=self.args["num_workers"],
-            pin_memory=True,
+
+        # 生成対象のクラスがなければ終了
+        if len(target_classes) == 0:
+            logging.info("[DI-DIMMD] No target classes (all already forgotten).")
+            return
+
+        #=== DeepInversionによる画像の生成 ===#
+        all_exemplars = []
+        all_labels = []
+
+        # labels_all = [0,0,0, 1,1,1, 5,5,5]
+        labels_all = np.repeat(np.array(target_classes, dtype=np.int64), n)
+
+        # # （必要ならシャッフル）
+        perm = np.random.permutation(labels_all.shape[0])
+        labels_all = labels_all[perm]
+
+        max_batch = getattr(self, "di_batch_size", 64)
+        start = 0
+        total = labels_all.shape[0]
+
+        # 繰り返して画像を生成する
+        while start < total:
+
+            end = min(start + max_batch, total)
+            batch_labels = labels_all[start:end]  # (B,)
+
+            if self.args["dataset"] in ["imagenet100"]:
+                di_imgs = self._generate_di_images_for_labels(batch_labels)
+            elif self.args["dataset"] in ["cifar100"]:
+                di_imgs = self._generate_di_images_for_labels_cifar(batch_labels)
+            else:
+                raise NotImplementedError
+
+            all_exemplars.append(di_imgs)      # (B, H, W, 3)
+            all_labels.append(batch_labels)    # (B,)
+            start = end
+        
+        new_data = np.concatenate(all_exemplars, axis=0)   # (N, H, W, 3)
+        new_labels = np.concatenate(all_labels, axis=0)    # (N,)
+
+        # 既存メモリが無ければ初期化
+        if (not hasattr(self, "_data_memory")) or (self._data_memory.size == 0):
+            self._data_memory = new_data.astype(np.uint8)
+            self._targets_memory = new_labels.astype(np.int64)
+        else:
+            self._data_memory = np.concatenate([self._data_memory, new_data.astype(np.uint8)], axis=0)
+            self._targets_memory = np.concatenate([self._targets_memory, new_labels.astype(np.int64)], axis=0)
+        
+        logging.info(
+            f"[DI-DIMMD2] Built DI memory: data={self._data_memory.shape}, "
+            f"labels classes={sorted(set(self._targets_memory.tolist()))}"
         )
-        _, inputs, targets = next(iter(loader))
-        inputs = inputs.to(self._device, non_blocking=True)
-        targets = targets.to(self._device, non_blocking=True)
-        return inputs, targets
 
-
-
-
-    # ============================================================
-    # 与えられたクラスラベル列に対して DeepInversion 画像を生成（ImageNet100）
-    # ============================================================  
     def _generate_di_images_for_labels(self, class_labels: np.ndarray) -> np.ndarray:
         """
         class_labels: np.ndarray, shape (B,)
@@ -1652,7 +1463,7 @@ class BASELINE_DIMMD2(BaseLearner):
         
         return out
 
-    def build_real_features(self, data_manager, per_class):
+    def build_real_features(self):
         """
         DeepInversionの画像生成（mmd損失）に使用する実画像の特徴を計算し保存する．
         保存先は self.real_features 
@@ -1666,7 +1477,6 @@ class BASELINE_DIMMD2(BaseLearner):
 
         # 保持対象とするクラス（今回のタスクで学習したクラス）
         target_classes = list(range(self._pre_known_classes, self._total_classes))
-        # print("target_classes: ", target_classes)
 
         # --------------------------------------------------
         # ２．データローダーの作成
@@ -1723,97 +1533,7 @@ class BASELINE_DIMMD2(BaseLearner):
                 self.real_features[c] = torch.stack(self.real_features[c], dim=0)
             else:
                 self.real_features[c] = torch.empty(0, feat_dim)
-        
 
-    # リプレイバッファの構築
-    def build_rehearsal_memory(self, data_manager, per_class):
-        """
-        [DIMMD2] DeepInversion-MMD で生成した画像を
-        「忘却済みクラス以外の全クラス」についてまとめて生成し，
-        self._data_memory / self._targets_memory に保存する。
-
-        ・生成対象クラス:
-            0 ~ self._total_classes-1 のうち，
-            self.forget_classes（すでに unlearn したクラス）を除いたもの
-        ・毎タスク再生成：既存のメモリは一度クリアして作り直す
-        """
-        # per_class 引数は無視し，固定 n を使う
-        n = getattr(self, "forget_memory_per_class", per_class)
-        if n <= 0:
-            logging.info("[DI-DIMMD2] Skip building DI memory (n <= 0).")
-            self._data_memory = np.array([], dtype=np.uint8)
-            self._targets_memory = np.array([], dtype=np.int64)
-            return
-
-        # すでに「忘却済み」となったクラス（もう二度と扱わない）
-        already_forgotten = set(getattr(self, "forget_classes", []))
-
-        # 今までに出現済み & まだ忘却していない全クラス
-        #   例: cur_task=2, total_classes=30 のとき → [0..29] から forget済みだけ除く
-        target_classes = [
-            c for c in range(self._total_classes)
-            if c not in already_forgotten
-        ]
-
-        logging.info(
-            f"[DI-DIMMD2] Building DI memory for ALL non-forgotten classes: "
-            f"n={n} per class, target_classes={target_classes}, "
-            f"already_forgotten={sorted(already_forgotten)}"
-        )
-
-        if len(target_classes) == 0:
-            logging.info("[DI-DIMMD2] No target classes (all already forgotten).")
-            self._data_memory = np.array([], dtype=np.uint8)
-            self._targets_memory = np.array([], dtype=np.int64)
-            return
-
-        # ====== ここから下は今の一括 DI 生成ロジックを流用 ======
-        all_exemplars = []
-        all_labels = []
-
-        # 例: target_classes = [0,1,5], n = 3 のとき
-        # labels_all = [0,0,0, 1,1,1, 5,5,5]
-        labels_all = np.repeat(np.array(target_classes, dtype=np.int64), n)
-
-        # （必要ならシャッフル）
-        perm = np.random.permutation(labels_all.shape[0])
-        labels_all = labels_all[perm]
-
-        max_batch = getattr(self, "di_batch_size", 64)
-        start = 0
-        total = labels_all.shape[0]
-
-        while start < total:
-            end = min(start + max_batch, total)
-            batch_labels = labels_all[start:end]  # (B,)
-
-            if self.args["dataset"] in ["imagenet100"]:
-                di_imgs = self._generate_di_images_for_labels(batch_labels)
-            elif self.args["dataset"] in ["cifar100"]:
-                di_imgs = self._generate_di_images_for_labels_cifar(batch_labels)
-            else:
-                raise NotImplementedError
-
-            all_exemplars.append(di_imgs)      # (B, H, W, 3)
-            all_labels.append(batch_labels)    # (B,)
-            start = end
-
-        new_data = np.concatenate(all_exemplars, axis=0)   # (N, H, W, 3)
-        new_labels = np.concatenate(all_labels, axis=0)    # (N,)
-
-        # [DIMMD2] 毎タスク「再生成」なので append ではなく上書き
-        self._data_memory = new_data
-        self._targets_memory = new_labels
-
-        logging.info(
-            f"[DI-DIMMD2] Built DI memory: data={self._data_memory.shape}, "
-            f"labels classes={sorted(set(self._targets_memory.tolist()))}"
-        )
-
-
-    # ============================================================
-    # DeepInversion で生成したリプレイ画像を保存 (.png + .pth)
-    # ============================================================
     def _save_di_images(self, checkpoint_dir: str):
         """
         checkpoint_dir:
@@ -1861,4 +1581,186 @@ class BASELINE_DIMMD2(BaseLearner):
         torch.save(save_obj, pth_path)
 
 
+
+
+
+    #-------------------- 評価関連の処理 --------------------
+    def eval_task(self):
+
+        # -------------------------
+        # CNN 評価
+        # -------------------------
+        #=== model の forward 処理 ===#
+        y_pred, y_true = self._eval_cnn(self.test_loader)
+        y_true = np.asarray(y_true)
+
+        #=== 忘却クラス / 保持クラスを分割するためのマスクを作成 ===#
+        forget_set = set(getattr(self, "forget_classes", []))
+        if len(forget_set) > 0:
+            mask_forget = np.isin(y_true, list(forget_set))
+        else:
+            mask_forget = np.zeros_like(y_true, dtype=bool)
+        mask_retain = ~mask_forget
+
+        #=== 保持クラスのみで精度を計算 ===#
+        if mask_retain.any():
+            y_pred_retain = y_pred[mask_retain]
+            y_true_retain = y_true[mask_retain]
+        else:
+            logging.warning(
+                "MU eval (CNN): no retain samples found, using all samples for metrics."
+            )
+            y_pred_retain = y_pred
+            y_true_retain = y_true
+        cnn_accy = self._evaluate(y_pred_retain, y_true_retain)
+
+        #=== 忘却クラスのみで精度を計算 ===#
+        if mask_forget.any():
+            y_pred_forget = y_pred[mask_forget]
+            top1_pred_forget = y_pred_forget[:, 0]
+            y_true_forget = y_true[mask_forget]
+            forget_acc_cnn = np.around(
+                (top1_pred_forget == y_true_forget).sum() * 100.0 / len(y_true_forget),
+                decimals=2,
+            )
+        else:
+            forget_acc_cnn = None
+        
+        # dict に精度を保存しておく
+        cnn_accy["forget_top1"] = forget_acc_cnn
+        cnn_accy["num_retain_samples"] = int(mask_retain.sum())
+        cnn_accy["num_forget_samples"] = int(mask_forget.sum())
+
+        # 記録の表示
+        logging.info(
+            f"MU eval (CNN) - retain samples: {mask_retain.sum()}, "
+            f"forget samples: {mask_forget.sum()}"
+        )
+        logging.info(f"MU eval (CNN) - forget top1: {forget_acc_cnn}")
+
+        #=== 維持クラス / 忘却クラス の CNN における調和平均 ===#
+        retain_acc_cnn = cnn_accy["top1"]
+
+        if forget_acc_cnn is not None:
+            forget_err_cnn = 100.0 - forget_acc_cnn
+            if retain_acc_cnn + forget_err_cnn > 0:
+                hmean_cnn = 2.0 * retain_acc_cnn * forget_err_cnn / (retain_acc_cnn + forget_err_cnn)
+            else:
+                hmean_cnn = 0.0
+        else:
+            forget_err_cnn = None
+            hmean_cnn = None
+
+        # dict に保存
+        cnn_accy["forget_err"] = forget_err_cnn
+        cnn_accy["hmean"] = hmean_cnn
+
+        # 記録の表示
+        logging.info(
+            f"MU (CNN) retain_acc={retain_acc_cnn:.2f}, "
+            f"forget_err={forget_err_cnn}, hmean={hmean_cnn}"
+        )
+
+        # -------------------------
+        # NME 評価
+        # -------------------------
+        nme_accy = None
+        y_pred_nme, y_true_nme = None, None
+
+        if hasattr(self, "_protos") and len(self._protos) > 0:
+            
+            # protos を class means として使う場合
+            protos = np.asarray(list(self._protos.values()))
+            protos = protos / (np.linalg.norm(protos, axis=1, keepdims=True) + 1e-8)
+            y_pred_nme, y_true_nme = self._eval_nme(self.test_loader, protos)
+        
+        if y_pred_nme is not None:
+            y_true_nme = np.asarray(y_true_nme)
+
+            if len(forget_set) > 0:
+                mask_forget_nme = np.isin(y_true_nme, list(forget_set))
+            else:
+                mask_forget_nme = np.zeros_like(y_true_nme, dtype=bool)
+            mask_retain_nme = ~mask_forget_nme
+
+            # 保持クラスのみで NME の精度を計算
+            if mask_retain_nme.any():
+                y_pred_retain_nme = y_pred_nme[mask_retain_nme]
+                y_true_retain_nme = y_true_nme[mask_retain_nme]
+            else:
+                logging.warning(
+                    "MU eval (NME): no retain samples found, using all samples for metrics."
+                )
+                y_pred_retain_nme = y_pred_nme
+                y_true_retain_nme = y_true_nme
+
+            nme_accy = self._evaluate(y_pred_retain_nme, y_true_retain_nme)
+
+            # 忘却クラスの精度（NME）
+            if mask_forget_nme.any():
+                top1_pred_forget_nme = y_pred_nme[mask_forget_nme][:, 0]
+                true_forget_nme = y_true_nme[mask_forget_nme]
+                forget_acc_nme = np.around(
+                    (top1_pred_forget_nme == true_forget_nme).sum()
+                    * 100.0
+                    / len(true_forget_nme),
+                    decimals=2,
+                )
+            else:
+                forget_acc_nme = None
+
+            nme_accy["forget_top1"] = forget_acc_nme
+            nme_accy["num_retain_samples"] = int(mask_retain_nme.sum())
+            nme_accy["num_forget_samples"] = int(mask_forget_nme.sum())
+
+            logging.info(f"MU eval (NME) - forget top1: {forget_acc_nme}")
+
+            #=== 維持クラス / 忘却クラス の NME における調和平均 ===#
+            retain_acc_nme = nme_accy["top1"]  # 保持クラスのみで計算した top1 (%)
+
+            if forget_acc_nme is not None:
+                forget_err_nme = 100.0 - forget_acc_nme
+                if retain_acc_nme + forget_err_nme > 0:
+                    hmean_nme = 2.0 * retain_acc_nme * forget_err_nme / (retain_acc_nme + forget_err_nme)
+                else:
+                    hmean_nme = 0.0
+            else:
+                forget_err_nme = None
+                hmean_nme = None
+
+            nme_accy["forget_err"] = forget_err_nme
+            nme_accy["hmean"] = hmean_nme
+
+            logging.info(
+                f"MU (NME) retain_acc={retain_acc_nme:.2f}, "
+                f"forget_err={forget_err_nme}, hmean={hmean_nme}"
+            )
+
+        return cnn_accy, nme_accy
+    
+    def _compute_accuracy(self, model, loader):
+        model.eval()
+        correct, total = 0, 0
+        for i, (_, inputs, targets) in enumerate(loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                outputs = model(inputs)["logits"][:, ::4]
+            predicts = torch.max(outputs, dim=1)[1]
+            correct += (predicts.cpu() == targets).sum()
+            total += len(targets)
+
+        return np.around(tensor2numpy(correct)*100 / total, decimals=2)
+
+    def _eval_cnn(self, loader):
+        self._network.eval()
+        y_pred, y_true = [], []
+        for _, (_, inputs, targets) in enumerate(loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                outputs = self._network(inputs)["logits"][:, ::4]
+            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]  
+            y_pred.append(predicts.cpu().numpy())
+            y_true.append(targets.cpu().numpy())
+
+        return np.concatenate(y_pred), np.concatenate(y_true)  
 

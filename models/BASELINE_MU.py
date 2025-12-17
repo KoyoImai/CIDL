@@ -343,10 +343,11 @@ class BASELINE_MU(BaseLearner):
                 lam = lam * 0.6
 
             # サンプルの特徴とプロトタイプを mixup
+            cls = np.random.choice(forget_class_list)
             if np.random.random() >= 0.5:
-                temp = (1 + lam) * self._protos[old_class_list[0]] - lam * features.detach().cpu().numpy()[i]
+                temp = (1 + lam) * self._protos[old_class_list[cls]] - lam * features.detach().cpu().numpy()[i]
             else:
-                temp = (1 - lam) * self._protos[old_class_list[0]] + lam * features.detach().cpu().numpy()[i]
+                temp = (1 - lam) * self._protos[old_class_list[cls]] + lam * features.detach().cpu().numpy()[i]
             
             # 擬似サンプル（擬似特徴）をリストに格納
             proto_features.append(temp)

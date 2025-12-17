@@ -10,9 +10,11 @@ from models.BASELINE_replay3 import BASELINE_replay3
 from models.BASELINE_replay4 import BASELINE_replay4
 from models.BASELINE_replay5 import BASELINE_replay5
 from models.BASELINE_replay6 import BASELINE_replay6
+from models.BASELINE_replay7 import BASELINE_replay7
 from models.BASELINE_DI import BASELINE_DI
 from models.BASELINE_DIMMD import BASELINE_DIMMD
 from models.BASELINE_DIMMD2 import BASELINE_DIMMD2
+from models.BASELINE_DIMMD3 import BASELINE_DIMMD3
 
 
 
@@ -46,12 +48,16 @@ def get_model(model_name, args):
         return BASELINE_replay5(args)
     elif name == "baseline-replay6":
         return BASELINE_replay6(args)
+    elif name == "baseline-replay7":
+        return BASELINE_replay7(args)
     elif name == "baseline-di":
         return BASELINE_DI(args)
     elif name == "baseline-dimmd":
         return BASELINE_DIMMD(args)
     elif name == "baseline-dimmd2":
         return BASELINE_DIMMD2(args)
-
+    elif name == "baseline-dimmd3":
+        return BASELINE_DIMMD3(args)
     else:
         assert 0
+
