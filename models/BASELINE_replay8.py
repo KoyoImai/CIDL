@@ -30,27 +30,50 @@ class BASELINE_replay8(BaseLearner):
 
         self.args = args
 
-        # backbone model の獲得
+        #=== Backbone model の獲得 ===#
         self._network = IncrementalNet(args, False)
+        self._memory_data = []
+        self._memory_targets = []
 
-        # プロトタイプの初期化
+        #=== プロトタイプの初期化 ===#
         self._protos = {}
 
-        #=== 使用する Unlearning 損失の種類 ===#
-        # ex) "maxim_entropy"，"proto_cos"
+        #=== 使用する Unlearning / retain 損失の種類 ===#
+        # ex) "maxim_entropy"，"proto_cos", "minimum_cosine"
         self.unleran_type = args["unlearn_type"]
 
-        # 忘却クラスの初期化
-        self.forget_classes = []                # 現在タスクで忘却する対象クラスのリスト
-        self.forget_list = args["forget_cls"]   # 将来忘却をするクラスのリスト
+        # ex) "l2"
+        self.retain_type = args["retain_type"]
 
-        # データセットのサイズを設定
+        #=== 忘却クラス関連の処理 ===#
+        self.forget_list = args["forget_cls"]   # タスク毎の忘却予定リスト
+        self.forget_classes = []
+        self.cur_forget_classes = []
+
+        # 全ての忘却クラスをまとめたリスト
+        self.all_forget_classes = sorted(
+            {c for task in self.forget_list for c in task}
+        )
+
+        #=== リプレイバッファ＆DeepInversion関係の設定 ===#
+        # 1クラスあたり保存するサンプル数 n
+        mem_per_cls = args.get("memory_per_class", 0)
+        self._memory_per_class = mem_per_cls
+
+        # 学習に使用する DI画像 のバッチサイズ
+        self.retain_batch_size = args["retain_batch_size"]
+        self.forget_batch_size = args["forget_batch_size"]
+
+        #=== データセット関係の設定 ===#
         if "cifar" in self.args["dataset"]:
             self.size = 32
+            self.num_classes = 100
         elif "tiny" in self.args["dataset"]:
             self.size = 56
+            self.num_classes = 200
         elif "imagenet" in self.args["dataset"]:
             self.size = 224
+            self.num_classes = 100
     
     def after_task(self):
 
@@ -74,11 +97,10 @@ class BASELINE_replay8(BaseLearner):
             self.build_rehearsal_memory(self.data_manager, m)
 
         #=== チェックポイントの保存 ===#
-        ckpt_dir = "checkpoint/{}/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
+        ckpt_dir = "checkpoint/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}/".format(
             self.args["model_name"],
             self.args["log_name"],
             self.args["dataset"],
-            self.args["unlearn_type"],
             self.args["init_cls"],
             self.args["increment"],
             self.args["lambda_fkd"], self.args["lambda_proto"], self.args["lambda_pes"], self.args["lambda_pgru"], self.args["lambda_unl"])
@@ -248,9 +270,9 @@ class BASELINE_replay8(BaseLearner):
             losses_new = 0.
             losses_fkd = 0.
             losses_proto = 0.
-            losses_unl = 0.
-            losses_unl_mem = 0.
-            
+            losses_forg = 0.
+            losses_retain = 0.
+
             correct = 0.
             total = 0.
 
@@ -302,10 +324,10 @@ class BASELINE_replay8(BaseLearner):
                 # ----------------------------------------
                 # ⑤ 損失を計算
                 # ----------------------------------------
-                logits, loss_new, loss_fkd, loss_proto, loss_di_forg, loss_di_retain = self._compute_loss(inputs, targets, aug_targets,
-                                                                                                          mem_forg_inputs, mem_forg_targets,
-                                                                                                          mem_retain_inputs, mem_retain_targets)
-                loss = loss_new + loss_fkd + loss_proto + loss_unl
+                logits, loss_new, loss_fkd, loss_proto, loss_forg, loss_retain = self._compute_loss(inputs, targets, aug_targets,
+                                                                                                    mem_forg_inputs, mem_forg_targets,
+                                                                                                    mem_retain_inputs, mem_retain_targets)
+                loss = loss_new + loss_fkd + loss_proto + loss_forg + loss_retain
 
                 # ----------------------------------------
                 # ⑥ パラメータを更新
@@ -319,7 +341,8 @@ class BASELINE_replay8(BaseLearner):
                 losses_new += loss_new.item()
                 losses_fkd += loss_fkd.item()
                 losses_proto += loss_proto.item()
-                losses_unl += loss_unl.item()
+                losses_forg += loss_forg.item()
+                losses_retain += loss_retain.item()
 
                 # 正解率の計算
                 _, preds = torch.max(logits, dim=1)
@@ -333,12 +356,12 @@ class BASELINE_replay8(BaseLearner):
 
             # 5 エポック毎に精度や損失を表示
             if epoch % 5 != 0:
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Train_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_unl/len(train_loader), train_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Loss_retain {:.3f}, Train_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_forg/len(train_loader), losses_retain/len(train_loader), train_acc)
             else:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
-                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_unl/len(train_loader), train_acc, test_acc)
+                info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Loss_new {:.3f}, Loss_fkd {:.3f}, Loss_proto {:.3f}, Loss_unl {:.3f}, Loss_retain {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}'.format(
+                    self._cur_task, epoch+1, self._epoch_num, losses/len(train_loader), losses_new/len(train_loader), losses_fkd/len(train_loader), losses_proto/len(train_loader), losses_forg/len(train_loader), losses_retain/len(train_loader), train_acc, test_acc)
             prog_bar.set_description(info)
             logging.info(info)
 
@@ -564,6 +587,7 @@ class BASELINE_replay8(BaseLearner):
             source="train",
             mode="test",
             appendent=(mem_data, mem_targets),
+            setup_replay=False,
         )
 
         # リプレイ用データローダーの作成
